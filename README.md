@@ -90,8 +90,9 @@ At a high level, the build engine performs the following steps:
 
 4. **Tracks build state**
 
-   * Records processed builds in `conf/hashes.txt`
-   * Prevents rebuilding identical release+PHP+variant combinations
+   * Records JCB hashes, source fingerprints, and verified Joomla base digests
+   * Rebuilds only combinations whose effective inputs changed
+   * Commits hash state only after every affected image succeeds
 
 5. **Calculates tag leadership**
 
@@ -107,8 +108,9 @@ At a high level, the build engine performs the following steps:
 
 7. **Builds and publishes images**
 
-   * Builds base images only if they do not already exist
-   * Applies all calculated tags
+   * Pulls and pins the verified official Joomla base-image digest
+   * Builds only changed base images
+   * Promotes rolling and `latest` aliases only after all base builds succeed
    * Pushes images to the registry (unless disabled)
 
 ---
@@ -215,6 +217,7 @@ Rules:
 ├── conf/                           # Declarative data & state
 │   ├── versions.json               # Supported Joomla / PHP / variant matrix
 │   ├── maintainers.json            # Image maintainer metadata
+│   ├── upstream-images.json         # Verified Linux/amd64 Joomla image digests
 │   ├── hashes.txt                  # Tracks built release combinations
 │   └── manifest.ndjson             # (generated) build manifest (NDJSON)
 │
@@ -231,6 +234,7 @@ Rules:
 │
 ├── src/                            # Executable & reusable source
 │   ├── bin/
+│   │   ├── check-joomla-releases.sh # Stable-release and Docker-tag detector
 │   │   └── joomengine.sh           # The build engine (authoritative logic)
 │   │
 │   └── docker/
@@ -245,7 +249,11 @@ Rules:
 │
 ├── .github/
 │   └── workflows/                  # Automation (thin by design)
-│       └── joomengine.yml
+│       ├── joomla-release-poll.yml # Upstream release/digest polling
+│       ├── joomengine.yml           # Changed-image publisher
+│       └── quality.yml              # Unit, lint, and image-smoke gates
+│
+├── tests/                           # Deterministic, network-free test suites
 │
 ├── .editorconfig
 ├── .gitignore
@@ -262,19 +270,37 @@ Rules:
 
 This repository uses GitHub Actions to run the build engine automatically.
 
-### Triggers
+### Release detection
 
-* Once per week (scheduled)
-* On merge to `master`
+Every six hours, the release poller:
+
+1. Reads Joomla's official stable-release feed
+2. Checks every configured PHP × variant tag on the official Joomla Docker Hub repository
+3. Waits successfully, without a repository change or failed workflow, while any candidate tag is unavailable
+4. Atomically updates `conf/versions.json` and `conf/upstream-images.json` only when a complete matrix is ready
+5. Dispatches the normal image publisher only when a version or tracked digest changed
+
+Digest-only changes are deliberate rebuild triggers, so refreshed upstream base
+images receive the same verification and publication path as new Joomla releases.
+
+### Build triggers
+
+* A JCB release dispatch
+* A build-input change merged to `master`
+* A ready Joomla version or official base-image digest change
 * Manual dispatch
 
 ### What CI does
 
 1. Checks out the repository
 2. Installs required tooling
-3. Authenticates with Docker
-4. Runs `./src/bin/joomengine.sh`
-5. Commits **any generated changes** back to the repository
+3. Runs deterministic unit tests
+4. Authenticates with Docker
+5. Runs `./src/bin/joomengine.sh`
+6. Commits only the generated image contexts and build-state files
+
+Pull requests also run ShellCheck, actionlint, JSON validation, unit tests, and
+representative Apache, FPM, and FPM-Alpine image builds.
 
 ### What CI does *not* do
 
@@ -298,7 +324,7 @@ Useful flags:
 
 ```bash
 -q, --quiet        Suppress all stdout output (exit code only)
--n, --dry-run      Do not build or push anything
+-n, --dry-run      Generate/review contexts without building or changing hashes
 -f, --force        Force update docker folder/files
     --build-only   Build images locally, do not push
 -h, --help         Show this help and exit

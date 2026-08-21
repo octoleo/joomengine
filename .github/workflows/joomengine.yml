@@ -2,89 +2,118 @@ name: JoomEngine – Automated Build & Version Tracking
 
 on:
   repository_dispatch:
-    types: [ pkg-component-builder-updated ]
+    types: [pkg-component-builder-updated]
 
   workflow_dispatch:
 
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/joomengine.yml"
+      - "conf/maintainers.json"
+      - "src/bin/joomengine.sh"
+      - "src/docker/**"
+
 permissions:
   contents: write
-  packages: write
+
+concurrency:
+  group: joomengine-publish
+  cancel-in-progress: false
 
 jobs:
   build-and-publish:
-    name: Run ./src/bin/joomengine.sh and track changes
+    name: Build changed image inputs
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
     steps:
-      # --------------------------------------------------
-      # CHECKOUT
-      # --------------------------------------------------
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      # --------------------------------------------------
-      # TOOLING
-      # --------------------------------------------------
       - name: Install required tooling
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            jq \
-            xmlstarlet \
+            curl \
             gawk \
-            curl
+            jq \
+            xmlstarlet
 
-      # --------------------------------------------------
-      # DOCKER AUTH (CI-ONLY)
-      # --------------------------------------------------
-      - name: Authenticate with Docker registry
-        uses: docker/login-action@v3
+      - name: Run deterministic unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tests/run.sh
+
+      - name: Authenticate with Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # --------------------------------------------------
-      # RUN SCRIPT
-      # --------------------------------------------------
-      - name: Run ./src/bin/joomengine.sh
+      - name: Build and publish changed images
+        shell: bash
         run: |
-          chmod +x ./src/bin/joomengine.sh
+          set -euo pipefail
           ./src/bin/joomengine.sh
 
-      # --------------------------------------------------
-      # DETECT CHANGES
-      # --------------------------------------------------
-      - name: Detect repository changes
-        id: git-status
+      - name: Validate generated changes
+        id: generated
+        shell: bash
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "changed=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=no" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          mapfile -t status_lines < <(
+            git -c status.renames=false status \
+              --porcelain=v1 \
+              --untracked-files=all
+          )
 
-      # --------------------------------------------------
-      # COMMIT BACK (ONLY IF NEEDED)
-      # --------------------------------------------------
-      - name: Commit and push changes
-        if: steps.git-status.outputs.changed == 'yes'
+          changed=no
+          for status_line in "${status_lines[@]}"; do
+            path="${status_line:3}"
+            case "$path" in
+              conf/hashes.txt|conf/manifest.ndjson|images/*)
+                changed=yes
+                ;;
+              *)
+                echo "Unexpected build-engine mutation: $path" >&2
+                git status --short >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          git diff --check -- conf/hashes.txt conf/manifest.ndjson images
+          jq -e . conf/manifest.ndjson >/dev/null
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Commit generated image state
+        if: steps.generated.outputs.changed == 'yes'
+        shell: bash
         run: |
-          DATE="$(date -u +'%Y-%m-%d')"
+          set -euo pipefail
+          build_date="$(date -u +'%Y-%m-%d')"
 
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A
-          git commit -m "chore: automated version update (${DATE})"
-          git push
+          git add -- conf/hashes.txt conf/manifest.ndjson images
+          git diff --cached --check
+          git commit -m "chore(images): refresh generated contexts (${build_date})"
 
-      # --------------------------------------------------
-      # NO-OP LOG (FOR VISIBILITY)
-      # --------------------------------------------------
-      - name: No changes detected
-        if: steps.git-status.outputs.changed == 'no'
-        run: |
-          echo "ℹ️ No repository changes detected — nothing to commit."
+          git fetch origin "$DEFAULT_BRANCH"
+          git rebase "origin/$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
 
+      - name: Record no-op result
+        if: steps.generated.outputs.changed == 'no'
+        shell: bash
+        run: echo "No generated repository changes detected."

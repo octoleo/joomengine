@@ -1,0 +1,142 @@
+name: Joomla – Stable Release Poll
+
+on:
+  schedule:
+    # Poll often enough to follow official releases without creating build noise.
+    - cron: "17 */6 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: joomengine-publish
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    name: Check Joomla and official Docker tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install release-check dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          command -v curl >/dev/null 2>&1 || missing+=(curl)
+          command -v jq >/dev/null 2>&1 || missing+=(jq)
+
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            sudo apt-get update
+            sudo apt-get install -y "${missing[@]}"
+          fi
+
+      - name: Run deterministic unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tests/run.sh
+
+      - name: Check stable Joomla releases
+        id: releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./src/bin/check-joomla-releases.sh
+
+      - name: Validate release-check mutation
+        if: steps.releases.outputs.changed == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t status_lines < <(git status --porcelain=v1 --untracked-files=all)
+
+          if [[ "${#status_lines[@]}" -eq 0 ]]; then
+            echo "The release detector reported a change but the worktree is clean." >&2
+            exit 1
+          fi
+
+          for status_line in "${status_lines[@]}"; do
+            path="${status_line:3}"
+            case "$path" in
+              conf/versions.json|conf/upstream-images.json)
+                ;;
+              *)
+                echo "Unexpected release-poll mutation: $path" >&2
+                git status --short >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          git diff --check -- conf/versions.json conf/upstream-images.json
+          jq -e . conf/versions.json >/dev/null
+          jq -e . conf/upstream-images.json >/dev/null
+
+      - name: Commit upstream image state
+        if: steps.releases.outputs.changed == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- conf/versions.json conf/upstream-images.json
+          git diff --cached --check
+          git commit -m "chore(joomla): refresh official base images"
+
+          git fetch origin "$DEFAULT_BRANCH"
+          git rebase "origin/$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+
+      - name: Trigger normal image build workflow
+        if: steps.releases.outputs.changed == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/joomengine.yml/dispatches" \
+            -f "ref=$DEFAULT_BRANCH"
+
+      - name: Record poll result
+        if: always() && steps.releases.outcome == 'success'
+        env:
+          CHANGED: ${{ steps.releases.outputs.changed }}
+          VERSIONS_CHANGED: ${{ steps.releases.outputs.versions_changed }}
+          DIGESTS_CHANGED: ${{ steps.releases.outputs.digests_changed }}
+          UPDATED_MAJORS: ${{ steps.releases.outputs.updated_majors }}
+          WAITING_MAJORS: ${{ steps.releases.outputs.waiting_majors }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Joomla stable release poll"
+            echo
+            echo "- Repository state changed: ${CHANGED:-no}"
+            echo "- Joomla versions changed: ${VERSIONS_CHANGED:-no}"
+            echo "- Base image digests changed: ${DIGESTS_CHANGED:-no}"
+            echo "- Updated majors: ${UPDATED_MAJORS:-none}"
+            echo "- Waiting for Docker tags: ${WAITING_MAJORS:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
