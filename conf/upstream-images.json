@@ -1,0 +1,24 @@
+{
+	"schema": 1,
+	"repository": "library/joomla",
+	"tags": {
+		"4.4.14-php8.1-apache": "sha256:4bc4ee674c1ee7e1520db35c5d3f29f8223b17df74f9c138c78dd1e849bb8919",
+		"4.4.14-php8.1-fpm": "sha256:28272320c5644726d9f5b9b913b089b68cf621dc0c6175c5277d62cfe09d39b4",
+		"4.4.14-php8.1-fpm-alpine": "sha256:90ac62a6ee5f402d8f536b7a9d3dd063062e1a8db30dad54328463850d43f97e",
+		"4.4.14-php8.2-apache": "sha256:06a1dc241e94ca5bae353ded30dfb191e1ca52c85615d92ce9eafae57e983dcc",
+		"4.4.14-php8.2-fpm": "sha256:f39b98ef09e98dfc3337e5e8d50a05a8d95c579e5bb1be6e1aa356fa72e63086",
+		"4.4.14-php8.2-fpm-alpine": "sha256:04942b069ad286af5ee06964494dbf6302c580c58f59a81e22c6b36fe43cf0ab",
+		"5.4.8-php8.2-apache": "sha256:52c343476838021e36daccf79f6cc86f2859f88fb065778c78a8fb8e180cff31",
+		"5.4.8-php8.2-fpm": "sha256:d3127efd4784589cb866e04a582dfefe87a00946e6eeab2ed5630d94c68bdfef",
+		"5.4.8-php8.2-fpm-alpine": "sha256:e3cd9e3a3b07c1556ec9e90584005946fb308127696b289fcaa66e02252d9c83",
+		"5.4.8-php8.3-apache": "sha256:299c67fe50bb0bc321020468f7912162f31f8ead8b3bcc892e7a0bf0d7e003ba",
+		"5.4.8-php8.3-fpm": "sha256:fb280bc3e74570751c3c59ffc08dfc232762a7315e9297417fc7ffe03cd191b8",
+		"5.4.8-php8.3-fpm-alpine": "sha256:365c170a8cefc6e6fbe613cc312116a9e8b46531eaa91ecd5468f4ec6233f116",
+		"6.1.3-php8.3-apache": "sha256:a7ad898b39fafa8384fa4a1c0bc3b739a2d6971dc7f896dce4ecc87e883aec58",
+		"6.1.3-php8.3-fpm": "sha256:73f33054e457e44fbdac7d33bd5538f3244f1998e565542f8f761daf1d20ca85",
+		"6.1.3-php8.3-fpm-alpine": "sha256:004ad71ef88cbd244f98f1bf536f2013872d17f7062f1c99d933d9eed14a1d12",
+		"6.1.3-php8.4-apache": "sha256:23bf1ad9498bb2b8238cd0c46bac8ef50dbf1cf0708bec8c9e806bcb9963d7a4",
+		"6.1.3-php8.4-fpm": "sha256:2acefaa61d5807c789be042ddc0ca04989210e1f3191aced4a17f44dcc75ce7f",
+		"6.1.3-php8.4-fpm-alpine": "sha256:130fa5430272ef8b24c2b0bfec8f8e740983799ef682b91cc8738ec20d4c5ef1"
+	}
+}

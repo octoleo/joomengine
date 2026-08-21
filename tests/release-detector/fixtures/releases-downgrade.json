@@ -1,0 +1,7 @@
+{
+	"branches": [
+		{"branch": "Joomla! 4", "version": "4.4.13"},
+		{"branch": "Joomla! 5", "version": "5.4.7"},
+		{"branch": "Joomla! 6", "version": "6.1.2"}
+	]
+}
