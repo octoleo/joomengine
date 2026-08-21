@@ -20,7 +20,8 @@ No manual installation. No guessing. Just run the container.
 - ✅ Optional extension installation via URL or path
 - ✅ Optional Joomla CLI automation
 - ✅ SMTP configuration support
-- ✅ Runs as `www-data` (no root runtime)
+- ✅ Web workers run as the configured Apache identity or FPM `www-data`
+- ✅ Unconditional ownership repair after all startup mutations
 
 These images are ideal for:
 
@@ -63,7 +64,8 @@ When the container starts:
    * **Joomla Component Builder is installed automatically**
    * SMTP configuration is applied (if provided)
    * Optional Joomla CLI commands are executed
-4. The container continues running as `www-data`
+4. The complete Joomla tree is recursively repaired to the web-worker UID:GID
+5. The upstream Apache/FPM server starts; its request workers run unprivileged
 
 This guarantees:
 
@@ -71,7 +73,7 @@ This guarantees:
 * ✓ No silent fallbacks
 * ✓ No race conditions
 * ✓ No repeated installs
-* ✓ No root-owned Joomla files
+* ✓ No root-owned Joomla files after a successful startup finalizer
 * ✓ Safe for repeated container restarts
 
 ---
@@ -108,6 +110,10 @@ The entrypoint runs in **strict mode** (`set -euo pipefail`). Missing or invalid
 | `JOOMLA_ADMIN_PASSWORD` | `joomengine@secure` |
 | `JOOMLA_ADMIN_EMAIL` | `joomengine@example.com` |
 
+> The bundled administrator values are development defaults. Always override
+> `JOOMLA_ADMIN_USERNAME`, `JOOMLA_ADMIN_PASSWORD`, and
+> `JOOMLA_ADMIN_EMAIL` with deployment-specific secrets in production.
+
 ### Auto-Deploy Requirements
 
 Automatic Joomla installation is performed **only if all** of the following are true:
@@ -137,7 +143,9 @@ Multiple values must be **semicolon-separated** (`;`):
 
 - `JOOMLA_CLI_COMMANDS` - Semicolon-separated Joomla CLI commands
 
-Each command is passed as-is to `cli/joomla.php`. **Shell tokenization is not performed.**
+Each command is split on whitespace into arguments and passed directly to
+`cli/joomla.php`. No shell evaluation, substitutions, pipes, or redirects are
+performed.
 
 #### Example
 ```yaml
@@ -147,9 +155,11 @@ environment:
 
 What happens:
 
-* Commands run **as `www-data`**
+* Commands run synchronously during the entrypoint bootstrap
 * Executed only after Joomla and JCB are ready
 * Failures stop the container (safe by default)
+* The final recursive ownership repair runs after the last command, including
+  when a command fails
 
 ### SMTP Configuration (Optional)
 
@@ -243,13 +253,21 @@ http://localhost:8080
 - Username: `joomengine`
 - Password: `joomengine@secure`
 
+These example credentials are for local development only. Override them for
+every shared, staging, or production deployment.
+
 ---
 
 ## 🔐 Security & Permissions
 
-* Joomla and JCB always run as `www-data`
-* Root is used **only** during bootstrap if required
-* File ownership is corrected automatically
+* The entrypoint and upstream server master may start as root, matching the
+  official Joomla Apache/FPM image model
+* Apache request workers use `APACHE_RUN_USER` and `APACHE_RUN_GROUP`; numeric
+  values such as `1000` are normalized to Apache's `#1000` form
+* FPM request workers run as `www-data`
+* Installer, extension, SMTP, and Joomla CLI operations are synchronous
+* File ownership is always repaired recursively after those operations and on
+  ordinary restarts; repair failures are fatal and visible
 * Safe for persistent volumes
 * Strict mode prevents silent misconfigurations
 

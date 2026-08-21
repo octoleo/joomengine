@@ -18,8 +18,8 @@ fi
 : "${JOOMLA_ADMIN_PASSWORD:=joomengine@secure}"
 : "${JOOMLA_ADMIN_EMAIL:=joomengine@example.com}"
 
-JOOMLA_WEBROOT="/var/www/html"
-JCB_ZIP_PATH="/usr/src/joomengine/jcb.zip"
+: "${JOOMLA_WEBROOT:=/var/www/html}"
+: "${JCB_ZIP_PATH:=/usr/src/joomengine/jcb.zip}"
 
 # Function to log messages
 joomla_log() {
@@ -130,9 +130,8 @@ joomla_get_host_port_by_colon() {
 
 # Run a Joomla CLI command
 #
-# CLI commands passed via JOOMLA_CLI_COMMANDS are treated as a single argument string.
-# Shell tokenization is not performed.
-# This is safer, but requires callers to structure commands exactly as expected by joomla.php
+# CLI commands passed via JOOMLA_CLI_COMMANDS are split on whitespace into
+# argv. Shell evaluation, substitutions, pipes, and redirects are not used.
 joomla_run_cli() {
     if [[ "$#" -eq 0 ]]; then
         joomla_log_error "No Joomla CLI command provided"
@@ -173,6 +172,7 @@ joomla_install_extension_via_url() {
         joomla_run_cli extension:install --url "$url" --no-interaction
     else
         joomla_log_error "Invalid URL: $url"
+        return 1
     fi
 }
 
@@ -183,6 +183,7 @@ joomla_install_extension_via_path() {
         joomla_run_cli extension:install --path "$path" --no-interaction
     else
         joomla_log_error "Invalid Path: $path"
+        return 1
     fi
 }
 
@@ -238,46 +239,186 @@ joomla_can_auto_deploy() {
     return 1
 }
 
-if [[ "$1" != apache2* && "$1" != "php-fpm" ]]; then
-    exec "$@"
-fi
+# Resolve a user reference to a numeric UID.
+#
+# Apache accepts numeric identities prefixed with '#'. Docker users commonly
+# provide either '#1000' or '1000', so both forms are supported here.
+joomla_resolve_uid() {
+    local identity="${1#\#}"
 
-uid="$(id -u)"
-gid="$(id -g)"
-if [ "$uid" = '0' ]; then
-    case "$1" in
+    if [[ "$identity" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$identity"
+        return 0
+    fi
+
+    if id -u "$identity" >/dev/null 2>&1; then
+        id -u "$identity"
+        return 0
+    fi
+
+    joomla_log_error "Unable to resolve runtime user '$1'."
+    return 1
+}
+
+# Resolve a group reference to a numeric GID without assuming that a user with
+# the same name exists.
+joomla_resolve_gid() {
+    local identity="${1#\#}"
+    local entry
+
+    if [[ "$identity" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$identity"
+        return 0
+    fi
+
+    if command -v getent >/dev/null 2>&1; then
+        entry="$(getent group "$identity" 2>/dev/null || true)"
+        if [[ -n "$entry" ]]; then
+            printf '%s\n' "$entry" | awk -F: '{ print $3; exit }'
+            return 0
+        fi
+    fi
+
+    entry="$(awk -F: -v name="$identity" '$1 == name { print $3; exit }' /etc/group)"
+    if [[ -n "$entry" ]]; then
+        printf '%s\n' "$entry"
+        return 0
+    fi
+
+    joomla_log_error "Unable to resolve runtime group '$1'."
+    return 1
+}
+
+# Resolve the identity used by the Apache/FPM worker processes. Bootstrap and
+# the server master process retain the official image's root startup model.
+joomla_resolve_runtime_identity() {
+    local server_command="$1"
+    local raw_user
+    local raw_group
+
+    if ! uid="$(id -u)" || ! gid="$(id -g)"; then
+        joomla_log_error "Unable to resolve the entrypoint UID:GID."
+        return 1
+    fi
+
+    if [[ "$uid" != '0' ]]; then
+        user="$uid"
+        group="$gid"
+        return 0
+    fi
+
+    case "$server_command" in
     apache2*)
-        user="${APACHE_RUN_USER:-www-data}"
-        group="${APACHE_RUN_GROUP:-www-data}"
+        raw_user="${APACHE_RUN_USER:-www-data}"
+        raw_group="${APACHE_RUN_GROUP:-www-data}"
+        if ! user="$(joomla_resolve_uid "$raw_user")" || \
+            ! group="$(joomla_resolve_gid "$raw_group")"; then
+            return 1
+        fi
 
-        # strip off any '#' symbol ('#1000' is valid syntax for Apache)
-        pound='#'
-        user="${user#"$pound"}"
-        group="${group#"$pound"}"
-
-        # set user if not exist
-        if ! id "$user" &>/dev/null; then
-            # get the user name
-            : "${USER_NAME:=www-data}"
-            # change the user name
-            [[ "$USER_NAME" != "www-data" ]] &&
-                usermod -l "$USER_NAME" www-data &&
-                groupmod -n "$USER_NAME" www-data
-            # update the user ID
-            groupmod -o -g "$user" "$USER_NAME"
-            # update the user-group ID
-            usermod -o -u "$group" "$USER_NAME"
+        # Apache requires '#' for a numeric User/Group directive. Normalizing
+        # bare numeric values keeps APACHE_RUN_* and the resolved IDs aligned.
+        if [[ "${raw_user#\#}" =~ ^[0-9]+$ ]]; then
+            APACHE_RUN_USER="#$user"
+            export APACHE_RUN_USER
+        fi
+        if [[ "${raw_group#\#}" =~ ^[0-9]+$ ]]; then
+            APACHE_RUN_GROUP="#$group"
+            export APACHE_RUN_GROUP
         fi
         ;;
     *) # php-fpm
-        user='www-data'
-        group='www-data'
+        if ! user="$(joomla_resolve_uid 'www-data')" || \
+            ! group="$(joomla_resolve_gid 'www-data')"; then
+            return 1
+        fi
         ;;
     esac
-else
-    user="$uid"
-    group="$gid"
-fi
+
+    if [[ "$user" == '0' || "$group" == '0' ]]; then
+        joomla_log_error "Refusing to assign Joomla ownership to root (${user}:${group})."
+        return 1
+    fi
+
+    joomla_log_info "Joomla runtime identity resolved to UID:GID ${user}:${group}."
+}
+
+# Deterministic finalizer: all synchronous installation/CLI activity has
+# finished before this runs. Always repair the complete tree when root, then
+# restore Joomla's read-only configuration.php mode.
+joomla_repair_webroot_ownership() {
+    if [[ "$uid" != '0' ]]; then
+        return 0
+    fi
+
+    joomla_log_info \
+        "Repairing ${JOOMLA_WEBROOT} ownership for runtime UID:GID ${user}:${group}."
+
+    if ! chown -R "$user:$group" "$JOOMLA_WEBROOT"; then
+        joomla_log_error \
+            "Failed to repair ${JOOMLA_WEBROOT} ownership for UID:GID ${user}:${group}."
+        return 1
+    fi
+
+    if [[ -e "${JOOMLA_WEBROOT}/configuration.php" ]] && \
+        ! chmod 0444 "${JOOMLA_WEBROOT}/configuration.php"; then
+        joomla_log_error "Failed to restore configuration.php permissions to 0444."
+        return 1
+    fi
+
+    joomla_log_info \
+        "Ownership repair completed successfully for UID:GID ${user}:${group}."
+}
+
+# Run the ownership repair once. A state value avoids retrying a failed chown
+# from the EXIT trap and prevents a second traversal after successful startup.
+joomla_finalize_webroot() {
+    case "${JOOMLA_OWNERSHIP_FINALIZER_STATE:-pending}" in
+    complete)
+        return 0
+        ;;
+    running | failed)
+        return 1
+        ;;
+    esac
+
+    JOOMLA_OWNERSHIP_FINALIZER_STATE='running'
+    if joomla_repair_webroot_ownership; then
+        JOOMLA_OWNERSHIP_FINALIZER_STATE='complete'
+        return 0
+    fi
+
+    JOOMLA_OWNERSHIP_FINALIZER_STATE='failed'
+    return 1
+}
+
+# Repair ownership even when a synchronous installer/extension/CLI command
+# aborts startup. Preserve the original error unless the repair itself fails.
+joomla_finalize_webroot_on_exit() {
+    local exit_status="$?"
+
+    trap - EXIT
+    if ! joomla_finalize_webroot; then
+        exit_status=1
+    fi
+
+    exit "$exit_status"
+}
+
+joomla_main() {
+    if [[ "$#" -eq 0 ]]; then
+        joomla_log_error "No startup command was provided."
+        return 1
+    fi
+
+    if [[ "$1" != apache2* && "$1" != "php-fpm" ]]; then
+        exec "$@"
+    fi
+
+    joomla_resolve_runtime_identity "$1"
+    cd "$JOOMLA_WEBROOT"
+    JOOMLA_OWNERSHIP_FINALIZER_STATE='pending'
+    trap joomla_finalize_webroot_on_exit EXIT
 
 # start Joomla message block
 joomla_echo_line_start
@@ -358,8 +499,9 @@ if [ ! -e index.php ] && [ ! -e libraries/src/Version.php ]; then
     joomla_log "Complete! Joomla has been successfully copied to $PWD"
 fi
 
-# Ensure the MySQL Database is created
-php /makedb.php "$JOOMLA_DB_HOST" "$JOOMLA_DB_USER" "$JOOMLA_DB_PASSWORD" "$JOOMLA_DB_NAME" "${JOOMLA_DB_TYPE:-mysqli}"
+# Ensure the MySQL Database is created.
+php /makedb.php "$JOOMLA_DB_HOST" "$JOOMLA_DB_USER" "$JOOMLA_DB_PASSWORD" \
+    "$JOOMLA_DB_NAME" "${JOOMLA_DB_TYPE:-mysqli}"
 
 # if the (installation) directory exists and we can auto deploy
 if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installation/joomla.php" ] && joomla_can_auto_deploy; then
@@ -383,7 +525,7 @@ if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installati
     # Run the auto deploy (install)
     if php "${JOOMLA_WEBROOT}/installation/joomla.php" install "${installJoomlaArgs[@]}"; then
         # The PHP command succeeded (so we remove the installation folder)
-        rm -rf installation
+        rm -rf "${JOOMLA_WEBROOT}/installation"
 
         joomla_log_configured_success_message
 
@@ -412,14 +554,20 @@ if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installati
 
         # add the smtp host to configuration file
         if [[ -n "${JOOMLA_SMTP_HOST:-}" && "${#JOOMLA_SMTP_HOST}" -gt 2 ]]; then
-            chmod +w configuration.php
-            sed -i "s/public \$mailer = 'mail';/public \$mailer = 'smtp';/g" configuration.php
-            sed -i "s/public \$smtphost = 'localhost';/public \$smtphost = '${JOOMLA_SMTP_HOST}';/g" configuration.php
+            chmod u+w "${JOOMLA_WEBROOT}/configuration.php"
+            sed -i \
+                "s/public \$mailer = 'mail';/public \$mailer = 'smtp';/g" \
+                "${JOOMLA_WEBROOT}/configuration.php"
+            sed -i \
+                "s/public \$smtphost = 'localhost';/public \$smtphost = '${JOOMLA_SMTP_HOST}';/g" \
+                "${JOOMLA_WEBROOT}/configuration.php"
         fi
 
         # add the smtp port to configuration file
         if [[ -n "${JOOMLA_SMTP_HOST_PORT:-}" ]]; then
-            sed -i "s/public \$smtpport = 25;/public \$smtpport = ${JOOMLA_SMTP_HOST_PORT};/g" configuration.php
+            sed -i \
+                "s/public \$smtpport = 25;/public \$smtpport = ${JOOMLA_SMTP_HOST_PORT};/g" \
+                "${JOOMLA_WEBROOT}/configuration.php"
         fi
 
         # run cli commands if found
@@ -430,18 +578,6 @@ if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installati
             done
         fi
 
-        # fix the configuration.php ownership
-        if [ "$uid" = '0' ] && [ "$(stat -c '%u:%g' configuration.php)" != "$user:$group" ]; then
-            # Set the correct ownership of all files touched during installation
-            if ! chown -R "$user:$group" .; then
-                joomla_log_error "Ownership of all files touched during installation failed to be corrected."
-            fi
-            # Set configuration to correct permissions
-            if ! chmod 444 configuration.php; then
-                joomla_log_error "Permissions of configuration.php failed to be corrected."
-            fi
-        fi
-
     else
         joomla_log_success_and_need_db_message
     fi
@@ -449,8 +585,18 @@ else
     joomla_log_success_and_need_db_message
 fi
 
+# Run after every normal startup, including already-installed sites. All
+# installer, extension, SMTP, and configured CLI mutations above are
+# synchronous, so this is the final filesystem mutation before server startup.
+joomla_finalize_webroot
+trap - EXIT
+
 # end Joomla message block
 joomla_echo_line_end
 
 exec "$@"
+}
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    joomla_main "$@"
+fi
