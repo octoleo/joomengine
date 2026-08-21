@@ -31,13 +31,13 @@ Usage: joomengine.sh [options]
 
 Options:
   -q, --quiet        Suppress all stdout output (exit code only)
-  -n, --dry-run      Do not build or push anything
+  -n, --dry-run      Generate/review contexts without building or changing hashes
   -f, --force        Force update docker folder/files
       --build-only   Build images locally, do not push
   -h, --help         Show this help and exit
 
 Behavior:
-  - Default: build + tag (push placeholder)
+  - Default: build, tag, and push changed image inputs
   - --dry-run: no build, no tag, no push
   - --force: force all docker files to be update
   - --build-only: build + tag, no push
@@ -101,6 +101,7 @@ VERSIONS_JSON_FILE="$REPO_ROOT/conf/versions.json"
 MAINTAINERS_JSON_FILE="$REPO_ROOT/conf/maintainers.json"
 HASHES_FILE="$REPO_ROOT/conf/hashes.txt"
 BUILD_MANIFEST_FILE="$REPO_ROOT/conf/manifest.ndjson"
+UPSTREAM_IMAGES_FILE="$REPO_ROOT/conf/upstream-images.json"
 
 # --------------------------------------------------
 # Safety check
@@ -114,6 +115,12 @@ fi
 if [[ ! -f "$MAINTAINERS_JSON_FILE" ]]; then
 	echo "[ERROR] Unable to determine maintainers file path"
 	echo "Resolved MAINTAINERS_JSON_FILE=$MAINTAINERS_JSON_FILE"
+	exit 1
+fi
+
+if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]]; then
+	echo "[ERROR] Unable to determine verified upstream image state" >&2
+	echo "Resolved UPSTREAM_IMAGES_FILE=$UPSTREAM_IMAGES_FILE" >&2
 	exit 1
 fi
 
@@ -142,8 +149,6 @@ TAG_LOG_FILE="$LOG_PATH/joomengine-tag.log"
 AWK_SCRIPT="$REPO_ROOT/src/docker/.jq-template.awk"
 if [ -n "${BASHBREW_SCRIPTS:-}" ]; then
 	AWK_SCRIPT="$BASHBREW_SCRIPTS/jq-template.awk"
-elif [ "$BASH_SOURCE" -nt "$AWK_SCRIPT" ]; then
-	wget -qO "$AWK_SCRIPT" 'https://github.com/docker-library/bashbrew/raw/5f0c26381fb7cc78b2d217d58007800bdcfbcfa1/scripts/jq-template.awk'
 fi
 
 BASE_XML_URL="https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads"
@@ -151,12 +156,44 @@ BASE_XML_URL="https://raw.githubusercontent.com/joomengine/Joomla-Component-Buil
 # --------------------------------------------------
 # TOOLING CHECK
 # --------------------------------------------------
-for cmd in jq curl xmlstarlet gawk grep sort; do
+for cmd in jq curl xmlstarlet gawk grep sort sha256sum find; do
 	command -v "$cmd" >/dev/null || {
 		echo "Missing required command: $cmd"
 		exit 1
 	}
 done
+
+if [[ -z "${BASHBREW_SCRIPTS:-}" ]] && [[ ! -f "$AWK_SCRIPT" || "$SCRIPT_PATH" -nt "$AWK_SCRIPT" ]]; then
+	AWK_TMP="$(mktemp "${AWK_SCRIPT}.download.XXXXXX")"
+	trap 'rm -f -- "$AWK_TMP"' EXIT
+	curl \
+		--fail \
+		--silent \
+		--show-error \
+		--location \
+		--retry 3 \
+		--connect-timeout 15 \
+		--max-time 60 \
+		--output "$AWK_TMP" \
+		'https://github.com/docker-library/bashbrew/raw/5f0c26381fb7cc78b2d217d58007800bdcfbcfa1/scripts/jq-template.awk'
+	mv "$AWK_TMP" "$AWK_SCRIPT"
+	trap - EXIT
+fi
+
+if ! jq -e '
+	type == "object" and
+	.schema == 1 and
+	.repository == "library/joomla" and
+	(.tags | type == "object") and
+	all(
+		.tags | to_entries[];
+		(.key | type == "string") and
+		(.value | type == "string" and test("^sha256:[a-f0-9]{64}$"))
+	)
+' "$UPSTREAM_IMAGES_FILE" >/dev/null; then
+	echo "[ERROR] Invalid upstream image state: $UPSTREAM_IMAGES_FILE" >&2
+	exit 1
+fi
 
 # --------------------------------------------------
 # GENERATED WARNING
@@ -203,13 +240,32 @@ mkdir -p "$LOG_PATH"
 : > "$BUILD_MANIFEST_FILE"
 
 # --------------------------------------------------
-# FORCE UPDATE OF ALL FILES
+# TRANSACTIONAL BUILD STATE
 # --------------------------------------------------
-if [[ "$FORCE_UPDATE" == "yes" ]]; then
-	: > "$HASHES_FILE"
-else
-	touch "$HASHES_FILE"
-fi
+touch "$HASHES_FILE"
+NEXT_HASHES_FILE="$(mktemp "${HASHES_FILE}.next.XXXXXX")"
+trap 'rm -f -- "$NEXT_HASHES_FILE"' EXIT
+
+# Any change to these inputs changes the generated image even if the upstream
+# Joomla and JCB versions remain the same.
+BUILD_INPUT_SHA="$(
+	for input_file in \
+		"$SCRIPT_PATH" \
+		"$AWK_SCRIPT" \
+		"$DOCKERFILE_TEMPLATE" \
+		"$DOCKER_ENTRYPOINT" \
+		"$MAINTAINERS_JSON_FILE"; do
+		sha256sum "$input_file" | awk '{ print $1 }'
+	done \
+		| sha256sum \
+		| awk '{ print $1 }'
+)"
+
+get_base_image_digest() {
+	local tag="$1"
+
+	jq -er --arg tag "$tag" '.tags[$tag]' "$UPSTREAM_IMAGES_FILE"
+}
 
 # --------------------------------------------------
 # VERSION PARSING
@@ -254,8 +310,10 @@ mapfile -t MAJORS < <(jq -r 'keys[]' "$VERSIONS_JSON_FILE")
 # --------------------------------------------------
 # PASS 1: CONTEXT GENERATION + RELEASE COLLECTION
 # --------------------------------------------------
-declare -a REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_JOOMLA
-declare -A PHP_LIST_BY_MAJOR VARIANT_LIST_BY_MAJOR HIGHEST_PHP_BY_MAJOR
+declare -a REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_INPUT_SHA REL_JOOMLA
+declare -A PHP_LIST_BY_MAJOR VARIANT_LIST_BY_MAJOR HIGHEST_PHP_BY_MAJOR PROCESSED_MAJORS
+declare -A PENDING_BUILDS
+PENDING_BUILD_COUNT=0
 
 for MAJOR in "${MAJORS[@]}"; do
 	echo
@@ -264,10 +322,21 @@ for MAJOR in "${MAJORS[@]}"; do
 	XML_URL="${BASE_XML_URL}/${MAJOR}.x/componentbuilder_update_server.xml"
 	TMP_XML="$(mktemp)"
 
-	if ! curl -fsSL "$XML_URL" -o "$TMP_XML"; then
-		echo "❌ Failed to fetch XML for $MAJOR - skipping"
+	if ! curl \
+		--fail \
+		--silent \
+		--show-error \
+		--location \
+		--retry 3 \
+		--retry-delay 2 \
+		--retry-connrefused \
+		--connect-timeout 15 \
+		--max-time 60 \
+		--output "$TMP_XML" \
+		"$XML_URL"; then
+		echo "❌ Failed to fetch XML for $MAJOR" >&2
 		rm -f "$TMP_XML"
-		continue
+		exit 1
 	fi
 
 	mapfile -t PHP_VERSIONS < <(jq -r ".\"$MAJOR\".php[]" "$VERSIONS_JSON_FILE")
@@ -291,34 +360,59 @@ for MAJOR in "${MAJORS[@]}"; do
 	)
 
 	if [[ "${#RELEASES[@]}" -eq 0 ]]; then
-		echo "❌ No releases found for $MAJOR - skipping"
+		echo "❌ No releases found for $MAJOR" >&2
 		rm -f "$TMP_XML"
-		continue
+		exit 1
 	fi
 
 	for ROW in "${RELEASES[@]}"; do
 		IFS='|' read -r VERSION URL TAG SHA <<<"$ROW"
 
 		if [[ -z "$SHA" ]]; then
-			echo "❌ Missing SHA for $VERSION - skipping entire major $MAJOR"
+			echo "❌ Missing SHA for $VERSION in major $MAJOR" >&2
 			rm -f "$TMP_XML"
-			continue 2
+				exit 1
 		fi
+
+		RELEASE_INPUT_SHA="$(
+			printf '%s\n' "$VERSION" "$URL" "$TAG" "$SHA" |
+				sha256sum |
+				awk '{ print $1 }'
+		)"
 
 		REL_MAJOR+=("$MAJOR")
 		REL_VERSION+=("$VERSION")
 		REL_URL+=("$URL")
 		REL_TAG+=("$TAG")
 		REL_SHA+=("$SHA")
+		REL_INPUT_SHA+=("$RELEASE_INPUT_SHA")
 		REL_JOOMLA+=("$JOOMLA_VERSION")
 
 		for PHP in "${PHP_VERSIONS[@]}"; do
 			for VARIANT in "${VARIANTS[@]}"; do
+				BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
+				if ! BASE_IMAGE_DIGEST="$(get_base_image_digest "$BASE_IMAGE_TAG")"; then
+					echo "[ERROR] Missing verified digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+					rm -f "$TMP_XML"
+					exit 1
+				fi
 
-				if grep -Fq "${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA}" "$HASHES_FILE"; then
+				HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_DIGEST}"
+				BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_DIGEST}"
+				target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}"
+				target_dir="${IMAGES_PATH}/${target}"
+
+				if [[ "$FORCE_UPDATE" == "no" ]] && \
+					grep -Fxq -- "$HASH_RECORD" "$HASHES_FILE" && \
+					[[ -f "${target_dir}/Dockerfile" ]] && \
+					[[ -f "${target_dir}/docker-entrypoint.sh" ]]; then
 					echo "✅ JCB-${VERSION} PHP-${PHP} J-${JOOMLA_VERSION}(${VARIANT}) already built - skipping"
+					printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
 					continue
 				fi
+
+				PENDING_BUILDS["$BUILD_KEY"]=1
+				PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
 
 				export JCB_VERSION="$VERSION"
 				export JCB_DOWNLOAD_URL="$URL"
@@ -328,9 +422,8 @@ for MAJOR in "${MAJORS[@]}"; do
 				export VARIANT="$VARIANT"
 				export MAJOR_VERSION="$MAJOR"
 				export JOOMLA_VERSION="$JOOMLA_VERSION"
+				export BASE_IMAGE_DIGEST="$BASE_IMAGE_DIGEST"
 
-				target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}"
-				target_dir="${IMAGES_PATH}/${target}"
 				mkdir -p "$target_dir"
 
 				echo "  -> generating ${target}"
@@ -343,12 +436,13 @@ for MAJOR in "${MAJORS[@]}"; do
 					gawk -f "${AWK_SCRIPT}" "${DOCKERFILE_TEMPLATE}"
 				} > "${target_dir}/Dockerfile"
 
-				printf "%s %s %s %s %s\n" "${VERSION}" "${PHP}" "${JOOMLA_VERSION}" "${VARIANT}" "${SHA}" >> "$HASHES_FILE"
+				printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
 			done
 
 		done
 	done
 
+	PROCESSED_MAJORS["$MAJOR"]=1
 	rm -f "$TMP_XML"
 done
 
@@ -533,6 +627,11 @@ for i in "${!REL_VERSION[@]}"; do
 			fi
 
 			context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}"
+			BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
+			if ! BASE_IMAGE_DIGEST="$(get_base_image_digest "$BASE_IMAGE_TAG")"; then
+				echo "[ERROR] Missing verified digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+				exit 1
+			fi
 
 			jq -nc \
 				--arg image "$IMAGE_NAME" \
@@ -544,6 +643,11 @@ for i in "${!REL_VERSION[@]}"; do
 				--arg php "$PHP" \
 				--arg variant "$VARIANT" \
 				--arg joomla "$JOOMLA_VERSION" \
+				--arg jcb_sha "${REL_SHA[$i]}" \
+				--arg release_input_sha "${REL_INPUT_SHA[$i]}" \
+				--arg build_input_sha "$BUILD_INPUT_SHA" \
+				--arg base_image "joomla:${BASE_IMAGE_TAG}@${BASE_IMAGE_DIGEST}" \
+				--arg base_digest "$BASE_IMAGE_DIGEST" \
 				--argjson tags "$(printf '%s\n' "${IMAGE_TAGS[@]}" | jq -R . | jq -s .)" \
 				'{
 					image: $image,
@@ -555,6 +659,11 @@ for i in "${!REL_VERSION[@]}"; do
 					php: $php,
 					variant: $variant,
 					joomla: $joomla,
+					jcb_sha: $jcb_sha,
+					release_input_sha: $release_input_sha,
+					build_input_sha: $build_input_sha,
+					base_image: $base_image,
+					base_digest: $base_digest,
 					base_tag: $tags[0],
 					tags: $tags
 				}' >> "$BUILD_MANIFEST_FILE"
@@ -570,16 +679,9 @@ echo "✅ Build manifest written to: $BUILD_MANIFEST_FILE"
 # --------------------------------------------------
 # DOCKER AUTH VALIDATION (before build+push)
 # --------------------------------------------------
-if [[ "$DRY_RUN" == "no" ]] && [[ "$BUILD_ONLY" == "no" ]]; then
+if [[ "$PENDING_BUILD_COUNT" -gt 0 ]] && [[ "$DRY_RUN" == "no" ]]; then
 	if ! docker info >/dev/null 2>&1; then
 		echo "❌ Docker daemon not reachable" >&2
-		exit 1
-	fi
-
-	# Check registry authentication (works for Docker Hub & others)
-	if ! docker info 2>/dev/null | grep -q "Username:"; then
-		echo "❌ Not authenticated with Docker registry" >&2
-		echo "   Run: docker login" >&2
 		exit 1
 	fi
 fi
@@ -591,6 +693,31 @@ echo
 echo "▶ Building Docker images from manifest"
 
 declare -A BUILT_IMAGES=()
+
+manifest_build_key() {
+	local line="$1"
+
+	echo "$line" | jq -r '
+		[
+			.version,
+			.php,
+			.joomla,
+			.variant,
+			.jcb_sha,
+			.release_input_sha,
+			.build_input_sha,
+			.base_digest
+		] | join("|")
+	'
+}
+
+is_pending_build() {
+	local line="$1"
+	local key
+
+	key="$(manifest_build_key "$line")"
+	[[ -n "${PENDING_BUILDS[$key]:-}" ]]
+}
 
 build_image() {
 	local LINE="$1"
@@ -607,15 +734,6 @@ build_image() {
 	FULL_CONTEXT_PATH="${IMAGES_PATH}/${CONTEXT_PATH}"
 
 	# --------------------------------------------------
-	# HARD SKIP: Image already exists in Docker
-	# --------------------------------------------------
-	if docker image inspect "$FULL_BASE_IMAGE" >/dev/null 2>&1; then
-		echo "  ↪ Image already exists, skipping build: $FULL_BASE_IMAGE"
-		BUILT_IMAGES["$FULL_BASE_IMAGE"]=1
-		return 0
-	fi
-
-	# --------------------------------------------------
 	# SOFT SKIP: Already built earlier in this run
 	# --------------------------------------------------
 	if [[ -n "${BUILT_IMAGES[$FULL_BASE_IMAGE]:-}" ]]; then
@@ -629,7 +747,7 @@ build_image() {
 	echo "  Context : ${CONTEXT_PATH}"
 
 	if [[ "$DRY_RUN" == "no" ]]; then
-		docker build -t "$FULL_BASE_IMAGE" "$FULL_CONTEXT_PATH"
+		docker build --pull -t "$FULL_BASE_IMAGE" "$FULL_CONTEXT_PATH"
 
 		echo "  ↪ Pushing $FULL_BASE_IMAGE"
 		if [[ "$BUILD_ONLY" == "no" ]]; then
@@ -638,9 +756,24 @@ build_image() {
 	fi
 
 	BUILT_IMAGES["$FULL_BASE_IMAGE"]=1
+}
+
+publish_image_tags() {
+	local LINE="$1"
+	local -a TAGS=()
+	local IMAGE
+	local BASE_TAG
+	local FULL_BASE_IMAGE
+	local TAG
+	local FULL_TAG
+
+	read -r IMAGE BASE_TAG < <(
+		echo "$LINE" | jq -r '[.image, .base_tag] | @tsv'
+	)
+	FULL_BASE_IMAGE="${IMAGE}:${BASE_TAG}"
 
 	# --------------------------------------------------
-	# Apply tags
+	# Apply rolling/channel tags only after every changed base image succeeded.
 	# --------------------------------------------------
 	mapfile -t TAGS < <(echo "$LINE" | jq -r '.tags[]')
 
@@ -649,12 +782,6 @@ build_image() {
 
 		# Base tag already applied
 		[[ "$FULL_TAG" == "$FULL_BASE_IMAGE" ]] && continue
-
-		# Avoid re-tagging if tag already exists
-		if docker image inspect "$FULL_TAG" >/dev/null 2>&1; then
-			echo "  ↪ Tag already exists, skipping: $FULL_TAG"
-			continue
-		fi
 
 		echo "  ↪ Tagging $FULL_TAG"
 		if [[ "$DRY_RUN" == "no" ]]; then
@@ -672,6 +799,7 @@ build_image() {
 # --------------------------------------------------
 while IFS= read -r line || [[ -n "$line" ]]; do
 	[[ -z "$line" ]] && continue
+	is_pending_build "$line" || continue
 
 	latest=$(echo "$line" | jq -r '.latest')
 
@@ -685,6 +813,7 @@ done < "$BUILD_MANIFEST_FILE"
 # --------------------------------------------------
 while IFS= read -r line || [[ -n "$line" ]]; do
 	[[ -z "$line" ]] && continue
+	is_pending_build "$line" || continue
 
 	latest=$(echo "$line" | jq -r '.latest')
 
@@ -693,11 +822,88 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 	build_image "$line"
 done < "$BUILD_MANIFEST_FILE"
 
+# --------------------------------------------------
+# publish aliases only after every pending base image was built successfully
+# --------------------------------------------------
+while IFS= read -r line || [[ -n "$line" ]]; do
+	[[ -z "$line" ]] && continue
+	is_pending_build "$line" || continue
+
+	latest=$(echo "$line" | jq -r '.latest')
+	[[ "$latest" == "yes" ]] && continue
+
+	publish_image_tags "$line"
+done < "$BUILD_MANIFEST_FILE"
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+	[[ -z "$line" ]] && continue
+	is_pending_build "$line" || continue
+
+	latest=$(echo "$line" | jq -r '.latest')
+	[[ "$latest" == "no" ]] && continue
+
+	publish_image_tags "$line"
+done < "$BUILD_MANIFEST_FILE"
+
+if [[ "$PENDING_BUILD_COUNT" -eq 0 ]]; then
+	echo "ℹ️  No changed image inputs detected - nothing to build or publish"
+fi
+
+if [[ "$DRY_RUN" == "no" ]]; then
+	# Generated contexts intentionally track one Joomla base version per JCB
+	# major. Prune the previous Joomla-version directory only after the new
+	# contexts were built and published successfully.
+	for MAJOR in "${MAJORS[@]}"; do
+		[[ -n "${PROCESSED_MAJORS[$MAJOR]:-}" ]] || continue
+		JOOMLA_VERSION="$(jq -r --arg major "$MAJOR" '.[$major].joomla' "$VERSIONS_JSON_FILE")"
+
+		while IFS= read -r -d '' jcb_dir; do
+			current_context="${jcb_dir}/j${JOOMLA_VERSION}"
+			[[ -d "$current_context" ]] || continue
+
+			while IFS= read -r -d '' stale_context; do
+				case "$stale_context" in
+				"$IMAGES_PATH"/jcb*/j*)
+					echo "  ↪ Removing stale generated context: ${stale_context#"$REPO_ROOT"/}"
+					rm -rf -- "$stale_context"
+					;;
+				*)
+					echo "[ERROR] Refusing to remove unexpected path: $stale_context" >&2
+					exit 1
+					;;
+				esac
+			done < <(
+				find "$jcb_dir" \
+					-mindepth 1 \
+					-maxdepth 1 \
+					-type d \
+					-name 'j*' \
+					! -name "j${JOOMLA_VERSION}" \
+					-print0
+			)
+		done < <(
+			find "$IMAGES_PATH" \
+				-mindepth 1 \
+				-maxdepth 1 \
+				-type d \
+				-name "jcb${MAJOR}.*" \
+				-print0
+		)
+	done
+
+	sort -u "$NEXT_HASHES_FILE" -o "$NEXT_HASHES_FILE"
+	chmod 0644 "$NEXT_HASHES_FILE"
+	mv "$NEXT_HASHES_FILE" "$HASHES_FILE"
+	trap - EXIT
+else
+	echo "ℹ️  Build state was not changed during dry-run"
+fi
+
 echo
 echo "✅ All images built and tagged successfully"
 
 if [[ "$DRY_RUN" == "no" ]] && [[ "$BUILD_ONLY" == "no" ]]; then
-	echo "✅ Repository push complete"
+	echo "✅ Registry publication complete"
 else
-	echo "ℹ️  Push skipped (dry-run or build-only)"
+	echo "ℹ️  Registry push skipped (dry-run or build-only)"
 fi
