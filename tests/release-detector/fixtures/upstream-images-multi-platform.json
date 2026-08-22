@@ -1,0 +1,17 @@
+{
+	"schema": 2,
+	"repository": "library/joomla",
+	"tags": {
+		"4.4.14-php8.1-apache": {
+			"index_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			"platforms": {
+				"linux/386": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+				"linux/amd64": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"linux/arm/v5": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				"linux/arm/v7": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				"linux/arm64/v8": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+				"linux/ppc64le": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+			}
+		}
+	}
+}

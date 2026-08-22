@@ -48,6 +48,11 @@ docker pull octoleo/joomengine:6.1.3-php8.2-apache
 
 > `latest` always points to the **highest stable JCB release**, Apache variant, using the highest supported PHP version.
 
+Every tag is published as a multi-platform Linux image containing all CPU
+architectures supplied by its selected official Joomla base image. Docker
+automatically pulls the matching architecture for the host, so the commands
+above stay the same on AMD64, ARM64, and the other supported platforms.
+
 ---
 
 ## 🧩 How It Works (Runtime Behavior)

@@ -5,7 +5,7 @@
 # -----------------------------------------------------------------------------
 # Official JCB v{{ env.JCB_VERSION }} image: extend the official Joomla! v{{ env.JOOMLA_VERSION }} image
 # -----------------------------------------------------------------------------
-FROM joomla:{{ env.JOOMLA_VERSION }}-php{{ env.PHP_VERSION }}-{{ env.VARIANT }}@{{ env.BASE_IMAGE_DIGEST }}
+FROM joomla:{{ env.JOOMLA_VERSION }}-php{{ env.PHP_VERSION }}-{{ env.VARIANT }}@{{ env.BASE_IMAGE_INDEX_DIGEST }}
 
 # Metadata
 LABEL maintainer="{{ env.MAINTAINERS }}"
@@ -14,7 +14,7 @@ LABEL org.opencontainers.image.description="Joomla! v{{ env.JOOMLA_VERSION }} + 
 LABEL org.opencontainers.image.version="{{ env.JCB_VERSION }}"
 LABEL org.opencontainers.image.source="https://github.com/octoleo/joomengine"
 LABEL org.opencontainers.image.base.name="docker.io/library/joomla:{{ env.JOOMLA_VERSION }}-php{{ env.PHP_VERSION }}-{{ env.VARIANT }}"
-LABEL org.opencontainers.image.base.digest="{{ env.BASE_IMAGE_DIGEST }}"
+LABEL org.opencontainers.image.base.digest="{{ env.BASE_IMAGE_INDEX_DIGEST }}"
 
 # -----------------------------------------------------------------------------
 # JCB metadata (required at build-time)

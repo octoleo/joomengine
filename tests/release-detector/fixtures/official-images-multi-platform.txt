@@ -1,0 +1,5 @@
+Tags: 4.4.14-php8.1-apache
+Architectures: ppc64le, arm32v7, amd64, arm64v8, i386, arm32v5
+
+Tags: 4.4.15-php8.1-apache
+Architectures: amd64, arm32v5, arm32v7, arm64v8, i386, ppc64le

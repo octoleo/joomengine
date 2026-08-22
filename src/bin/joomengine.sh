@@ -24,6 +24,7 @@ QUIET="no"
 DRY_RUN="no"
 BUILD_ONLY="no"
 FORCE_UPDATE="no"
+PLATFORMS_SPEC="auto"
 
 show_help() {
 	cat <<'EOF'
@@ -34,13 +35,16 @@ Options:
   -n, --dry-run      Generate/review contexts without building or changing hashes
   -f, --force        Force update docker folder/files
       --build-only   Build images locally, do not push
+      --platforms    Platforms to build: auto or a comma-separated Linux subset
   -h, --help         Show this help and exit
 
 Behavior:
-  - Default: build, tag, and push changed image inputs
+  - Default: build and push every platform supported by each Joomla base image
   - --dry-run: no build, no tag, no push
   - --force: force all docker files to be update
-  - --build-only: build + tag, no push
+  - --build-only: build and load one local platform, no push
+  - --platforms auto: publish the exact upstream platform set (the default)
+  - --build-only --platforms auto: detect and load the local host platform
   - --quiet: suppress stdout (errors still affect exit code)
 EOF
 }
@@ -66,6 +70,18 @@ while [[ $# -gt 0 ]]; do
 			BUILD_ONLY="yes"
 			shift
 			;;
+		--platforms)
+			if [[ $# -lt 2 ]]; then
+				echo "❌ --platforms requires auto or a comma-separated Linux platform list" >&2
+				exit 1
+			fi
+			PLATFORMS_SPEC="$2"
+			shift 2
+			;;
+		--platforms=*)
+			PLATFORMS_SPEC="${1#*=}"
+			shift
+			;;
 		-h|--help)
 			show_help
 			exit 0
@@ -77,6 +93,73 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+validate_platform_name() {
+	local platform="$1"
+
+	[[ "$platform" =~ ^linux/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$ ]]
+}
+
+canonicalize_platform_name() {
+	local platform="$1"
+
+	case "$platform" in
+		linux/arm64)
+			printf '%s\n' 'linux/arm64/v8'
+			;;
+		linux/arm)
+			printf '%s\n' 'linux/arm/v7'
+			;;
+		linux/amd64/v1)
+			printf '%s\n' 'linux/amd64'
+			;;
+		*)
+			printf '%s\n' "$platform"
+			;;
+	esac
+}
+
+validate_platforms_option() {
+	local -a requested=()
+	local -a canonical_requested=()
+	local platform
+	local canonical_platform
+	declare -A seen=()
+
+	[[ "$PLATFORMS_SPEC" == "auto" ]] && return 0
+	[[ -n "$PLATFORMS_SPEC" ]] || {
+		echo "❌ --platforms cannot be empty" >&2
+		return 1
+	}
+	[[ "$PLATFORMS_SPEC" != *, ]] || {
+		echo "❌ --platforms contains an empty platform" >&2
+		return 1
+	}
+
+	IFS=',' read -r -a requested <<< "$PLATFORMS_SPEC"
+	for platform in "${requested[@]}"; do
+		if ! validate_platform_name "$platform"; then
+			echo "❌ Invalid platform '$platform'; expected canonical linux/architecture[/variant]" >&2
+			return 1
+		fi
+		canonical_platform="$(canonicalize_platform_name "$platform")"
+		if [[ -n "${seen[$canonical_platform]:-}" ]]; then
+			echo "❌ Duplicate platform in --platforms after normalization: $platform" >&2
+			return 1
+		fi
+		seen["$canonical_platform"]=1
+		canonical_requested+=("$canonical_platform")
+	done
+
+	if [[ "$BUILD_ONLY" == "yes" ]] && [[ "${#canonical_requested[@]}" -ne 1 ]]; then
+		echo "❌ --build-only can load exactly one explicit platform" >&2
+		return 1
+	fi
+
+	PLATFORMS_SPEC="$(IFS=,; echo "${canonical_requested[*]}")"
+}
+
+validate_platforms_option
 
 # --------------------------------------------------
 # QUIET MODE (stdout only)
@@ -182,13 +265,20 @@ fi
 
 if ! jq -e '
 	type == "object" and
-	.schema == 1 and
+	.schema == 2 and
 	.repository == "library/joomla" and
 	(.tags | type == "object") and
 	all(
 		.tags | to_entries[];
 		(.key | type == "string") and
-		(.value | type == "string" and test("^sha256:[a-f0-9]{64}$"))
+		(.value | type == "object") and
+		(.value.index_digest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
+		(.value.platforms | type == "object" and length > 0) and
+		all(
+			.value.platforms | to_entries[];
+			(.key | test("^linux/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$")) and
+			(.value | type == "string" and test("^sha256:[a-f0-9]{64}$"))
+		)
 	)
 ' "$UPSTREAM_IMAGES_FILE" >/dev/null; then
 	echo "[ERROR] Invalid upstream image state: $UPSTREAM_IMAGES_FILE" >&2
@@ -237,14 +327,37 @@ mkdir -p "$LOG_PATH"
 # INIT FILES
 # --------------------------------------------------
 : > "$TAG_LOG_FILE"
-: > "$BUILD_MANIFEST_FILE"
+
+# Preserve the last committed/generated alias topology before regenerating the
+# manifest. Alias ownership can change even when no image content changes.
+PREVIOUS_BUILD_MANIFEST_FILE="$(mktemp "${BUILD_MANIFEST_FILE}.previous.XXXXXX")"
+if [[ -f "$BUILD_MANIFEST_FILE" ]]; then
+	cp "$BUILD_MANIFEST_FILE" "$PREVIOUS_BUILD_MANIFEST_FILE"
+fi
+NEXT_BUILD_MANIFEST_FILE="$(mktemp "${BUILD_MANIFEST_FILE}.next.XXXXXX")"
 
 # --------------------------------------------------
 # TRANSACTIONAL BUILD STATE
 # --------------------------------------------------
 touch "$HASHES_FILE"
 NEXT_HASHES_FILE="$(mktemp "${HASHES_FILE}.next.XXXXXX")"
-trap 'rm -f -- "$NEXT_HASHES_FILE"' EXIT
+trap 'rm -f -- "$NEXT_HASHES_FILE" "$PREVIOUS_BUILD_MANIFEST_FILE" "$NEXT_BUILD_MANIFEST_FILE"' EXIT
+declare -a STORED_ALIAS_TOPOLOGY_LINES=()
+mapfile -t STORED_ALIAS_TOPOLOGY_LINES < <(
+	awk '$1 == "alias-topology" { print }' "$HASHES_FILE"
+)
+if [[ "${#STORED_ALIAS_TOPOLOGY_LINES[@]}" -gt 1 ]]; then
+	echo "[ERROR] Multiple alias topology records found in $HASHES_FILE" >&2
+	exit 1
+fi
+OLD_ALIAS_TOPOLOGY_SHA=""
+if [[ "${#STORED_ALIAS_TOPOLOGY_LINES[@]}" -eq 1 ]]; then
+	if [[ ! "${STORED_ALIAS_TOPOLOGY_LINES[0]}" =~ ^alias-topology\ ([a-f0-9]{64})$ ]]; then
+		echo "[ERROR] Invalid alias topology record in $HASHES_FILE" >&2
+		exit 1
+	fi
+	OLD_ALIAS_TOPOLOGY_SHA="${BASH_REMATCH[1]}"
+fi
 
 # Any change to these inputs changes the generated image even if the upstream
 # Joomla and JCB versions remain the same.
@@ -261,10 +374,100 @@ BUILD_INPUT_SHA="$(
 		| awk '{ print $1 }'
 )"
 
-get_base_image_digest() {
+get_base_image_index_digest() {
 	local tag="$1"
 
-	jq -er --arg tag "$tag" '.tags[$tag]' "$UPSTREAM_IMAGES_FILE"
+	jq -er --arg tag "$tag" '.tags[$tag].index_digest' "$UPSTREAM_IMAGES_FILE"
+}
+
+get_base_platforms_json() {
+	local tag="$1"
+
+	jq -ec --arg tag "$tag" '
+		.tags[$tag].platforms |
+		to_entries | sort_by(.key) | from_entries
+	' "$UPSTREAM_IMAGES_FILE"
+}
+
+detect_local_platform() {
+	local architecture
+
+	if [[ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]]; then
+		if ! validate_platform_name "$DOCKER_DEFAULT_PLATFORM"; then
+			echo "[ERROR] Invalid DOCKER_DEFAULT_PLATFORM: $DOCKER_DEFAULT_PLATFORM" >&2
+			return 1
+		fi
+		canonicalize_platform_name "$DOCKER_DEFAULT_PLATFORM"
+		return 0
+	fi
+
+	architecture="$(uname -m)"
+	case "$architecture" in
+		x86_64|amd64)
+			architecture="amd64"
+			;;
+		i386|i486|i586|i686|x86)
+			architecture="386"
+			;;
+		aarch64|arm64)
+			architecture="arm64/v8"
+			;;
+		armv5*)
+			architecture="arm/v5"
+			;;
+		armv6*)
+			architecture="arm/v6"
+			;;
+		armv7*)
+			architecture="arm/v7"
+			;;
+		ppc64le|riscv64|s390x)
+			;;
+		*)
+			architecture="${architecture,,}"
+			;;
+	esac
+
+	printf 'linux/%s\n' "$architecture"
+}
+
+select_base_platforms() {
+	local tag="$1"
+	local platform
+	local -a requested=()
+
+	BASE_PLATFORMS_JSON="$(get_base_platforms_json "$tag")" || return 1
+
+	if [[ "$PLATFORMS_SPEC" == "auto" ]]; then
+		if [[ "$BUILD_ONLY" == "yes" ]]; then
+			requested+=("$(detect_local_platform)")
+		else
+			mapfile -t requested < <(jq -r 'keys[]' <<< "$BASE_PLATFORMS_JSON")
+		fi
+	else
+		IFS=',' read -r -a requested <<< "$PLATFORMS_SPEC"
+	fi
+
+	for platform in "${requested[@]}"; do
+		if ! jq -e --arg platform "$platform" 'has($platform)' <<< "$BASE_PLATFORMS_JSON" >/dev/null; then
+			echo "[ERROR] Platform $platform is not available for official Joomla image tag: $tag" >&2
+			return 1
+		fi
+	done
+
+	SELECTED_PLATFORMS_CSV="$(IFS=,; echo "${requested[*]}")"
+	SELECTED_PLATFORMS_JSON="$(printf '%s\n' "${requested[@]}" | jq -R . | jq -sc .)"
+	SELECTED_PLATFORM_DIGESTS_JSON="$(
+		jq -cn \
+			--argjson available "$BASE_PLATFORMS_JSON" \
+			--argjson selected "$SELECTED_PLATFORMS_JSON" \
+			'reduce $selected[] as $platform ({}; .[$platform] = $available[$platform])'
+	)"
+	BASE_PLATFORM_STATE_SHA="$(
+		jq -cS . <<< "$BASE_PLATFORMS_JSON" |
+			sha256sum |
+			awk '{ print $1 }'
+	)"
 }
 
 # --------------------------------------------------
@@ -391,14 +594,18 @@ for MAJOR in "${MAJORS[@]}"; do
 		for PHP in "${PHP_VERSIONS[@]}"; do
 			for VARIANT in "${VARIANTS[@]}"; do
 				BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
-				if ! BASE_IMAGE_DIGEST="$(get_base_image_digest "$BASE_IMAGE_TAG")"; then
-					echo "[ERROR] Missing verified digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+				if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
+					echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+					rm -f "$TMP_XML"
+					exit 1
+				fi
+				if ! select_base_platforms "$BASE_IMAGE_TAG"; then
 					rm -f "$TMP_XML"
 					exit 1
 				fi
 
-				HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_DIGEST}"
-				BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_DIGEST}"
+				HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_INDEX_DIGEST} ${BASE_PLATFORM_STATE_SHA} ${SELECTED_PLATFORMS_CSV}"
+				BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_INDEX_DIGEST}|${BASE_PLATFORM_STATE_SHA}|${SELECTED_PLATFORMS_CSV}"
 				target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}"
 				target_dir="${IMAGES_PATH}/${target}"
 
@@ -422,7 +629,7 @@ for MAJOR in "${MAJORS[@]}"; do
 				export VARIANT="$VARIANT"
 				export MAJOR_VERSION="$MAJOR"
 				export JOOMLA_VERSION="$JOOMLA_VERSION"
-				export BASE_IMAGE_DIGEST="$BASE_IMAGE_DIGEST"
+				export BASE_IMAGE_INDEX_DIGEST="$BASE_IMAGE_INDEX_DIGEST"
 
 				mkdir -p "$target_dir"
 
@@ -468,6 +675,15 @@ done
 # PASS 3: TAG EMISSION + BUILD MANIFEST
 # --------------------------------------------------
 IMAGE_NAME="octoleo/joomengine"
+EXPECTED_MANIFEST_RECORD_COUNT=0
+for manifest_index in "${!REL_MAJOR[@]}"; do
+	IFS=' ' read -r -a expected_php_versions <<< "${PHP_LIST_BY_MAJOR[${REL_MAJOR[$manifest_index]}]}"
+	IFS=' ' read -r -a expected_variants <<< "${VARIANT_LIST_BY_MAJOR[${REL_MAJOR[$manifest_index]}]}"
+	EXPECTED_MANIFEST_RECORD_COUNT=$((
+		EXPECTED_MANIFEST_RECORD_COUNT +
+		${#expected_php_versions[@]} * ${#expected_variants[@]}
+	))
+done
 
 emit_tag() {
 	printf "  - %s:%s\n" "$IMAGE_NAME" "$1" >> "$TAG_LOG_FILE"
@@ -628,8 +844,11 @@ for i in "${!REL_VERSION[@]}"; do
 
 			context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}"
 			BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
-			if ! BASE_IMAGE_DIGEST="$(get_base_image_digest "$BASE_IMAGE_TAG")"; then
-				echo "[ERROR] Missing verified digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+			if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
+				echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+				exit 1
+			fi
+			if ! select_base_platforms "$BASE_IMAGE_TAG"; then
 				exit 1
 			fi
 
@@ -646,8 +865,12 @@ for i in "${!REL_VERSION[@]}"; do
 				--arg jcb_sha "${REL_SHA[$i]}" \
 				--arg release_input_sha "${REL_INPUT_SHA[$i]}" \
 				--arg build_input_sha "$BUILD_INPUT_SHA" \
-				--arg base_image "joomla:${BASE_IMAGE_TAG}@${BASE_IMAGE_DIGEST}" \
-				--arg base_digest "$BASE_IMAGE_DIGEST" \
+				--arg base_image "joomla:${BASE_IMAGE_TAG}@${BASE_IMAGE_INDEX_DIGEST}" \
+				--arg base_index_digest "$BASE_IMAGE_INDEX_DIGEST" \
+				--arg base_platform_state_sha "$BASE_PLATFORM_STATE_SHA" \
+				--argjson base_platforms "$BASE_PLATFORMS_JSON" \
+				--argjson platforms "$SELECTED_PLATFORMS_JSON" \
+				--argjson platform_digests "$SELECTED_PLATFORM_DIGESTS_JSON" \
 				--argjson tags "$(printf '%s\n' "${IMAGE_TAGS[@]}" | jq -R . | jq -s .)" \
 				'{
 					image: $image,
@@ -663,36 +886,36 @@ for i in "${!REL_VERSION[@]}"; do
 					release_input_sha: $release_input_sha,
 					build_input_sha: $build_input_sha,
 					base_image: $base_image,
-					base_digest: $base_digest,
+					base_index_digest: $base_index_digest,
+					base_platform_state_sha: $base_platform_state_sha,
+					base_platforms: $base_platforms,
+					platforms: $platforms,
+					platform_digests: $platform_digests,
 					base_tag: $tags[0],
 					tags: $tags
-				}' >> "$BUILD_MANIFEST_FILE"
+				}' >> "$NEXT_BUILD_MANIFEST_FILE"
 
 			echo >> "$TAG_LOG_FILE"
 		done
 	done
 done
 
+if ! jq -s -e \
+	--argjson expected "$EXPECTED_MANIFEST_RECORD_COUNT" \
+	'length == $expected and all(.[]; type == "object")' \
+	"$NEXT_BUILD_MANIFEST_FILE" >/dev/null; then
+	echo "[ERROR] Generated build manifest is incomplete or invalid" >&2
+	exit 1
+fi
+if [[ -f "$BUILD_MANIFEST_FILE" ]]; then
+	chmod --reference="$BUILD_MANIFEST_FILE" "$NEXT_BUILD_MANIFEST_FILE"
+else
+	chmod 0644 "$NEXT_BUILD_MANIFEST_FILE"
+fi
+mv "$NEXT_BUILD_MANIFEST_FILE" "$BUILD_MANIFEST_FILE"
+
 echo "✅ Tag review written to: $TAG_LOG_FILE"
 echo "✅ Build manifest written to: $BUILD_MANIFEST_FILE"
-
-# --------------------------------------------------
-# DOCKER AUTH VALIDATION (before build+push)
-# --------------------------------------------------
-if [[ "$PENDING_BUILD_COUNT" -gt 0 ]] && [[ "$DRY_RUN" == "no" ]]; then
-	if ! docker info >/dev/null 2>&1; then
-		echo "❌ Docker daemon not reachable" >&2
-		exit 1
-	fi
-fi
-
-# --------------------------------------------------
-# PASS 4: BUILD IMAGES FROM MANIFEST (NDJSON + jq)
-# --------------------------------------------------
-echo
-echo "▶ Building Docker images from manifest"
-
-declare -A BUILT_IMAGES=()
 
 manifest_build_key() {
 	local line="$1"
@@ -706,7 +929,9 @@ manifest_build_key() {
 			.jcb_sha,
 			.release_input_sha,
 			.build_input_sha,
-			.base_digest
+			.base_index_digest,
+			.base_platform_state_sha,
+			(.platforms | join(","))
 		] | join("|")
 	'
 }
@@ -719,15 +944,500 @@ is_pending_build() {
 	[[ -n "${PENDING_BUILDS[$key]:-}" ]]
 }
 
+validate_pending_manifest_record() {
+	local line="$1"
+	local computed_platform_state_sha
+
+	if ! jq -e '
+		(.base_index_digest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
+		(.base_platform_state_sha | type == "string" and test("^[a-f0-9]{64}$")) and
+		(.base_platforms | type == "object" and length > 0) and
+		(.platforms | type == "array" and length > 0) and
+		(.platforms | unique | length) == (.platforms | length) and
+		(.platform_digests | type == "object") and
+		(. as $record |
+		all(
+			$record.platforms[];
+			. as $platform |
+			($record.base_platforms[$platform] | type == "string") and
+			$record.platform_digests[$platform] == $record.base_platforms[$platform]
+		)
+		) and
+		(.platform_digests | length) == (.platforms | length)
+	' <<< "$line" >/dev/null; then
+		echo "[ERROR] Invalid platform provenance in pending build manifest record" >&2
+		return 1
+	fi
+
+	computed_platform_state_sha="$(
+		jq -cS '.base_platforms' <<< "$line" |
+			sha256sum |
+			awk '{ print $1 }'
+	)"
+	if [[ "$computed_platform_state_sha" != "$(jq -r '.base_platform_state_sha' <<< "$line")" ]]; then
+		echo "[ERROR] Platform provenance hash does not match the pending build manifest" >&2
+		return 1
+	fi
+
+	if [[ "$BUILD_ONLY" == "yes" ]] && \
+	   [[ "$(jq -r '.platforms | length' <<< "$line")" -ne 1 ]]; then
+		echo "[ERROR] Local build-only records must target exactly one platform" >&2
+		return 1
+	fi
+}
+
+validate_alias_manifest_record() {
+	local line="$1"
+
+	jq -e '
+		. as $record |
+		type == "object" and
+		(.image | type == "string" and length > 0) and
+		(.base_tag | type == "string" and length > 0) and
+		(.tags | type == "array" and length > 0) and
+		all(.tags[]; type == "string" and length > 0) and
+		(.tags | unique | length) == (.tags | length) and
+		(.tags | index($record.base_tag)) != null
+	' <<< "$line" >/dev/null
+}
+
+declare -A OLD_ALIAS_BASE=()
+declare -A NEW_ALIAS_BASE=()
+declare -A NEW_ALIAS_RECORD=()
+declare -A NEW_BASE_RECORD=()
+declare -A PENDING_BASE_IMAGES=()
+PENDING_ALIAS_PROMOTION_COUNT=0
+NEW_ALIAS_TOPOLOGY_SHA=""
+ALIAS_TOPOLOGY_CHANGED="no"
+
+load_previous_alias_topology() {
+	local line
+	local image
+	local base_tag
+	local tag
+	local full_base_image
+	local full_tag
+
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		[[ -z "$line" ]] && continue
+		if ! validate_alias_manifest_record "$line"; then
+			echo "[ERROR] Invalid previous build manifest alias record" >&2
+			return 1
+		fi
+
+		read -r image base_tag < <(jq -r '[.image, .base_tag] | @tsv' <<< "$line")
+		full_base_image="${image}:${base_tag}"
+		while IFS= read -r tag; do
+			full_tag="${image}:${tag}"
+			[[ "$full_tag" == "$full_base_image" ]] && continue
+			if [[ -n "${OLD_ALIAS_BASE[$full_tag]:-}" ]] && \
+			   [[ "${OLD_ALIAS_BASE[$full_tag]}" != "$full_base_image" ]]; then
+				echo "[ERROR] Conflicting previous alias ownership for $full_tag" >&2
+				return 1
+			fi
+			OLD_ALIAS_BASE["$full_tag"]="$full_base_image"
+		done < <(jq -r '.tags[]' <<< "$line")
+	done < "$PREVIOUS_BUILD_MANIFEST_FILE"
+}
+
+load_new_alias_topology() {
+	local line
+	local image
+	local base_tag
+	local tag
+	local full_base_image
+	local full_tag
+	local -a sorted_aliases=()
+
+	# First register every immutable base tag so no rolling alias can silently
+	# claim another record's immutable name.
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		[[ -z "$line" ]] && continue
+		if ! validate_alias_manifest_record "$line" || \
+		   ! validate_pending_manifest_record "$line"; then
+			echo "[ERROR] Invalid generated build manifest record" >&2
+			return 1
+		fi
+		read -r image base_tag < <(jq -r '[.image, .base_tag] | @tsv' <<< "$line")
+		full_base_image="${image}:${base_tag}"
+		if [[ -n "${NEW_BASE_RECORD[$full_base_image]:-}" ]] && \
+		   [[ "${NEW_BASE_RECORD[$full_base_image]}" != "$line" ]]; then
+			echo "[ERROR] Conflicting immutable base ownership for $full_base_image" >&2
+			return 1
+		fi
+		NEW_BASE_RECORD["$full_base_image"]="$line"
+		if is_pending_build "$line"; then
+			PENDING_BASE_IMAGES["$full_base_image"]=1
+		fi
+	done < "$BUILD_MANIFEST_FILE"
+
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		[[ -z "$line" ]] && continue
+		read -r image base_tag < <(jq -r '[.image, .base_tag] | @tsv' <<< "$line")
+		full_base_image="${image}:${base_tag}"
+		while IFS= read -r tag; do
+			full_tag="${image}:${tag}"
+			[[ "$full_tag" == "$full_base_image" ]] && continue
+
+			if [[ -n "${NEW_BASE_RECORD[$full_tag]:-}" ]]; then
+				echo "[ERROR] Rolling alias conflicts with immutable base tag: $full_tag" >&2
+				return 1
+			fi
+			if [[ -n "${NEW_ALIAS_BASE[$full_tag]:-}" ]] && \
+			   [[ "${NEW_ALIAS_BASE[$full_tag]}" != "$full_base_image" ]]; then
+				echo "[ERROR] Conflicting generated alias ownership for $full_tag" >&2
+				return 1
+			fi
+			NEW_ALIAS_BASE["$full_tag"]="$full_base_image"
+			NEW_ALIAS_RECORD["$full_tag"]="$line"
+		done < <(jq -r '.tags[]' <<< "$line")
+	done < "$BUILD_MANIFEST_FILE"
+
+	if [[ "${#NEW_ALIAS_BASE[@]}" -gt 0 ]]; then
+		mapfile -t sorted_aliases < <(printf '%s\n' "${!NEW_ALIAS_BASE[@]}" | sort)
+	fi
+	NEW_ALIAS_TOPOLOGY_SHA="$({
+		for full_tag in "${sorted_aliases[@]}"; do
+			printf '%s\t%s\n' "$full_tag" "${NEW_ALIAS_BASE[$full_tag]}"
+		done
+	} | sha256sum | awk '{ print $1 }')"
+
+	if [[ "$OLD_ALIAS_TOPOLOGY_SHA" != "$NEW_ALIAS_TOPOLOGY_SHA" ]]; then
+		ALIAS_TOPOLOGY_CHANGED="yes"
+		PENDING_ALIAS_PROMOTION_COUNT="${#NEW_ALIAS_BASE[@]}"
+	else
+		for full_tag in "${!NEW_ALIAS_BASE[@]}"; do
+			full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
+			if [[ -n "${PENDING_BASE_IMAGES[$full_base_image]:-}" ]]; then
+				PENDING_ALIAS_PROMOTION_COUNT=$((PENDING_ALIAS_PROMOTION_COUNT + 1))
+			fi
+		done
+	fi
+}
+
+builder_platform_key() {
+	local platform
+
+	platform="$(canonicalize_platform_name "${1%\*}")"
+
+	case "$platform" in
+		linux/arm64/v8)
+			printf '%s\n' 'linux/arm64'
+			;;
+		*)
+			printf '%s\n' "$platform"
+			;;
+	esac
+}
+
+builder_supports_platform() {
+	local requested="$1"
+	local key
+
+	key="$(builder_platform_key "$requested")"
+	[[ -n "${BUILDER_PLATFORMS[$key]:-}" ]] && return 0
+
+	# A newer 32-bit ARM worker can execute images targeting older ARM variants.
+	case "$requested" in
+		linux/arm/v5)
+			[[ -n "${BUILDER_PLATFORMS[linux/arm/v6]:-}" || \
+			   -n "${BUILDER_PLATFORMS[linux/arm/v7]:-}" ]]
+			;;
+		linux/arm/v6)
+			[[ -n "${BUILDER_PLATFORMS[linux/arm/v7]:-}" ]]
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+preflight_buildx() {
+	local inspect_output
+	local line
+	local platform_list
+	local platform
+	local key
+	local -a missing=()
+	declare -gA BUILDER_PLATFORMS=()
+
+	command -v docker >/dev/null || {
+		echo "❌ Missing required command: docker" >&2
+		return 1
+	}
+	if ! docker info >/dev/null 2>&1; then
+		echo "❌ Docker daemon not reachable" >&2
+		return 1
+	fi
+	if ! docker buildx version >/dev/null 2>&1; then
+		echo "❌ Docker Buildx is not available" >&2
+		return 1
+	fi
+	if ! inspect_output="$(docker buildx inspect --bootstrap 2>&1)"; then
+		echo "❌ Unable to inspect or bootstrap the active Buildx builder" >&2
+		printf '%s\n' "$inspect_output" >&2
+		return 1
+	fi
+
+	while IFS= read -r line; do
+		[[ "$line" == *Platforms:* ]] || continue
+		platform_list="${line#*Platforms:}"
+		platform_list="${platform_list//,/ }"
+		for platform in $platform_list; do
+			key="$(builder_platform_key "$platform")"
+			validate_platform_name "$key" || continue
+			BUILDER_PLATFORMS["$key"]=1
+		done
+	done <<< "$inspect_output"
+
+	if [[ "${#BUILDER_PLATFORMS[@]}" -eq 0 ]]; then
+		echo "❌ The active Buildx builder did not report any Linux platforms" >&2
+		return 1
+	fi
+
+	for platform in "${!REQUIRED_BUILDER_PLATFORMS[@]}"; do
+		builder_supports_platform "$platform" || missing+=("$platform")
+	done
+
+	if [[ "${#missing[@]}" -gt 0 ]]; then
+		mapfile -t missing < <(printf '%s\n' "${missing[@]}" | sort)
+		echo "❌ Active Buildx builder does not support required platform(s): $(IFS=,; echo "${missing[*]}")" >&2
+		return 1
+	fi
+}
+
+# --------------------------------------------------
+# VALIDATE THE COMPLETE PENDING BATCH BEFORE ANY BUILD OR PUSH
+# --------------------------------------------------
+declare -A REQUIRED_BUILDER_PLATFORMS=()
+
+load_previous_alias_topology || exit 1
+load_new_alias_topology || exit 1
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+	[[ -z "$line" ]] && continue
+	is_pending_build "$line" || continue
+	validate_pending_manifest_record "$line" || exit 1
+	while IFS= read -r platform; do
+		REQUIRED_BUILDER_PLATFORMS["$platform"]=1
+	done < <(jq -r '.platforms[]' <<< "$line")
+done < "$BUILD_MANIFEST_FILE"
+
+NEEDS_DOCKER_PREFLIGHT="no"
+if [[ "$PENDING_BUILD_COUNT" -gt 0 ]] || \
+   { [[ "$BUILD_ONLY" == "no" ]] && [[ "$PENDING_ALIAS_PROMOTION_COUNT" -gt 0 ]]; }; then
+	NEEDS_DOCKER_PREFLIGHT="yes"
+fi
+if [[ "$DRY_RUN" == "no" ]] && [[ "$NEEDS_DOCKER_PREFLIGHT" == "yes" ]]; then
+	preflight_buildx || exit 1
+fi
+
+is_sha256_digest() {
+	[[ "$1" =~ ^sha256:[a-f0-9]{64}$ ]]
+}
+
+resolve_registry_tag_digest() {
+	local image_tag="$1"
+	local expected_digest="${2:-}"
+	local manifest_json=""
+	local observed_digest=""
+	local retry_delay="${JOOMENGINE_REGISTRY_RETRY_DELAY_SECONDS:-1}"
+	local max_attempts=5
+	local attempt
+	local sleep_seconds
+
+	[[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+	REGISTRY_RESOLVED_DIGEST=""
+
+	for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+		observed_digest=""
+		if manifest_json="$(
+			docker buildx imagetools inspect \
+				--format '{{json .Manifest}}' \
+				"$image_tag" 2>/dev/null
+		)"; then
+			observed_digest="$(jq -er '.digest' <<< "$manifest_json" 2>/dev/null || true)"
+		fi
+
+		if is_sha256_digest "$observed_digest" && \
+		   [[ -z "$expected_digest" || "$observed_digest" == "$expected_digest" ]]; then
+			REGISTRY_RESOLVED_DIGEST="$observed_digest"
+			return 0
+		fi
+
+		if [[ "$attempt" -lt "$max_attempts" ]]; then
+			sleep_seconds=$((retry_delay * (1 << (attempt - 1))))
+			((sleep_seconds > 0)) && sleep "$sleep_seconds"
+		fi
+	done
+
+	if [[ -n "$expected_digest" ]]; then
+		echo "❌ Registry tag did not resolve to the pushed digest: $image_tag" >&2
+		echo "  Expected: $expected_digest" >&2
+		echo "  Observed: ${observed_digest:-unavailable}" >&2
+	else
+		echo "❌ Unable to resolve registry digest for $image_tag" >&2
+	fi
+	return 1
+}
+
+normalize_index_platforms() {
+	jq -ec '
+		def is_attestation_descriptor:
+			(.platform | type == "object") and
+			.platform.os == "unknown" and
+			.platform.architecture == "unknown" and
+			.annotations["vnd.docker.reference.type"] == "attestation-manifest";
+
+		def normalized_descriptor_platform:
+			if is_attestation_descriptor then
+				empty
+			elif (.platform | type != "object") then
+				error("manifest descriptor has no platform object")
+			elif .platform.os != "linux" then
+				error("manifest descriptor is not a runnable Linux platform")
+			elif (.platform.architecture | type != "string" or length == 0 or . == "unknown") then
+				error("manifest descriptor has an invalid architecture")
+			else
+				.platform |
+				(.variant // "") as $variant |
+				if .architecture == "arm64" then
+					"linux/arm64/\(if $variant == "" then "v8" else $variant end)"
+				elif .architecture == "arm" then
+					"linux/arm/\(if $variant == "" then "v7" else $variant end)"
+				elif .architecture == "amd64" and ($variant == "" or $variant == "v1") then
+					"linux/amd64"
+				elif $variant != "" then
+					"linux/\(.architecture)/\($variant)"
+				else
+					"linux/\(.architecture)"
+				end
+			end;
+
+		[
+			.manifests[] |
+			normalized_descriptor_platform
+		] as $platforms |
+		($platforms | unique) as $unique_platforms |
+		if ($platforms | length) != ($unique_platforms | length) then
+			error("duplicate canonical runnable platform descriptors")
+		else
+			$unique_platforms
+		end
+	'
+}
+
+normalize_single_image_platform() {
+	jq -ec '
+		if type != "object" then
+			error("single-image configuration is not an object")
+		elif .os != "linux" then
+			error("single-image configuration is not Linux")
+		elif (.architecture | type != "string" or length == 0 or . == "unknown") then
+			error("single-image configuration has an invalid architecture")
+		else . end |
+		(.variant // "") as $variant |
+		[
+			if .architecture == "arm64" then
+				"linux/arm64/\(if $variant == "" then "v8" else $variant end)"
+			elif .architecture == "arm" then
+				"linux/arm/\(if $variant == "" then "v7" else $variant end)"
+			elif .architecture == "amd64" and ($variant == "" or $variant == "v1") then
+				"linux/amd64"
+			elif $variant != "" then
+				"linux/\(.architecture)/\($variant)"
+			else
+				"linux/\(.architecture)"
+			end
+		]
+	'
+}
+
+verify_published_platforms() {
+	local line="$1"
+	local image="$2"
+	local expected_platforms
+	local actual_platforms=""
+	local raw_manifest=""
+	local image_metadata=""
+	local retry_delay="${JOOMENGINE_REGISTRY_RETRY_DELAY_SECONDS:-1}"
+	local attempt
+	local sleep_seconds
+	local max_attempts=5
+
+	[[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+	expected_platforms="$(jq -c '.platforms | sort | unique' <<< "$line")"
+
+	for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+		actual_platforms=""
+		if raw_manifest="$(
+			docker buildx imagetools inspect --raw "$image" 2>/dev/null
+		)" && jq -e . <<< "$raw_manifest" >/dev/null 2>&1; then
+			if jq -e '.manifests | type == "array"' <<< "$raw_manifest" >/dev/null 2>&1; then
+				if ! actual_platforms="$(normalize_index_platforms <<< "$raw_manifest")"; then
+					actual_platforms=""
+				fi
+			else
+				# A registry may return a single image manifest when exactly one
+				# platform was pushed. Buildx can resolve its image configuration,
+				# which carries the missing OS/architecture metadata.
+				if image_metadata="$(
+					docker buildx imagetools inspect \
+						--format '{{json .Image}}' \
+						"$image" 2>/dev/null
+				)"; then
+					if ! actual_platforms="$(normalize_single_image_platform <<< "$image_metadata")"; then
+						actual_platforms=""
+					fi
+				fi
+			fi
+		fi
+
+		if [[ -n "$actual_platforms" ]] && [[ "$actual_platforms" == "$expected_platforms" ]]; then
+			echo "  ↪ Verified registry platforms for $image"
+			return 0
+		fi
+
+		if [[ "$attempt" -lt "$max_attempts" ]]; then
+			sleep_seconds=$((retry_delay * (1 << (attempt - 1))))
+			((sleep_seconds > 0)) && sleep "$sleep_seconds"
+		fi
+	done
+
+	echo "❌ Published platform verification failed for $image" >&2
+	echo "  Expected: $expected_platforms" >&2
+	echo "  Observed: ${actual_platforms:-unavailable}" >&2
+	return 1
+}
+
+# --------------------------------------------------
+# PASS 4: BUILD IMAGES FROM MANIFEST (NDJSON + jq)
+# --------------------------------------------------
+echo
+echo "▶ Building Docker images from manifest"
+
+declare -A BUILT_IMAGES=()
+declare -A VERIFIED_REGISTRY_SOURCE_DIGESTS=()
+
 build_image() {
 	local LINE="$1"
+	local IMAGE
+	local CONTEXT_PATH
+	local BASE_TAG
+	local PLATFORM_CSV
+	local FULL_BASE_IMAGE
+	local FULL_CONTEXT_PATH
+	local METADATA_FILE=""
+	local OUTPUT_DIGEST=""
+	local DESCRIPTOR_DIGEST=""
+	local -a BUILD_COMMAND=(docker buildx build --pull)
 
 	# Skip empty lines
 	[[ -z "$LINE" ]] && return 0
 
 	# Parse required fields
-	read -r IMAGE CONTEXT_PATH BASE_TAG < <(
-		echo "$LINE" | jq -r '[.image, .context, .base_tag] | @tsv'
+	read -r IMAGE CONTEXT_PATH BASE_TAG PLATFORM_CSV < <(
+		echo "$LINE" | jq -r '[.image, .context, .base_tag, (.platforms | join(","))] | @tsv'
 	)
 
 	FULL_BASE_IMAGE="${IMAGE}:${BASE_TAG}"
@@ -745,53 +1455,95 @@ build_image() {
 	echo "--------------------------------------------------"
 	echo "▶ Building $FULL_BASE_IMAGE"
 	echo "  Context : ${CONTEXT_PATH}"
+	echo "  Platforms: ${PLATFORM_CSV}"
 
 	if [[ "$DRY_RUN" == "no" ]]; then
-		docker build --pull -t "$FULL_BASE_IMAGE" "$FULL_CONTEXT_PATH"
+		BUILD_COMMAND+=(--platform "$PLATFORM_CSV")
+		BUILD_COMMAND+=(--tag "$FULL_BASE_IMAGE")
 
-		echo "  ↪ Pushing $FULL_BASE_IMAGE"
-		if [[ "$BUILD_ONLY" == "no" ]]; then
-			docker push "$FULL_BASE_IMAGE"
+		if [[ "$BUILD_ONLY" == "yes" ]]; then
+			BUILD_COMMAND+=(--load)
+		else
+			METADATA_FILE="$(mktemp "${LOG_PATH}/build-metadata.XXXXXX.json")"
+			BUILD_COMMAND+=(--metadata-file "$METADATA_FILE")
+			BUILD_COMMAND+=(--push)
+		fi
+		BUILD_COMMAND+=("$FULL_CONTEXT_PATH")
+		if ! "${BUILD_COMMAND[@]}"; then
+			[[ -z "$METADATA_FILE" ]] || rm -f -- "$METADATA_FILE"
+			return 1
+		fi
+
+		if [[ "$BUILD_ONLY" == "yes" ]]; then
+			echo "  ↪ Loaded $FULL_BASE_IMAGE into the local image store"
+		else
+			OUTPUT_DIGEST="$(
+				jq -er '."containerimage.digest"' "$METADATA_FILE" 2>/dev/null || true
+			)"
+			DESCRIPTOR_DIGEST="$(
+				jq -er '."containerimage.descriptor".digest' "$METADATA_FILE" 2>/dev/null || true
+			)"
+			rm -f -- "$METADATA_FILE"
+			if ! is_sha256_digest "$OUTPUT_DIGEST" || \
+			   ! is_sha256_digest "$DESCRIPTOR_DIGEST" || \
+			   [[ "$OUTPUT_DIGEST" != "$DESCRIPTOR_DIGEST" ]]; then
+				echo "❌ Buildx returned inconsistent image digest metadata for $FULL_BASE_IMAGE" >&2
+				echo "  Output digest: ${OUTPUT_DIGEST:-unavailable}" >&2
+				echo "  Descriptor digest: ${DESCRIPTOR_DIGEST:-unavailable}" >&2
+				return 1
+			fi
+
+			echo "  ↪ Pushed multi-platform image $FULL_BASE_IMAGE"
+			resolve_registry_tag_digest "$FULL_BASE_IMAGE" "$OUTPUT_DIGEST" || return 1
+			verify_published_platforms "$LINE" "${IMAGE}@${OUTPUT_DIGEST}" || return 1
+			VERIFIED_REGISTRY_SOURCE_DIGESTS["$FULL_BASE_IMAGE"]="$OUTPUT_DIGEST"
 		fi
 	fi
 
 	BUILT_IMAGES["$FULL_BASE_IMAGE"]=1
 }
 
-publish_image_tags() {
-	local LINE="$1"
-	local -a TAGS=()
-	local IMAGE
-	local BASE_TAG
-	local FULL_BASE_IMAGE
-	local TAG
-	local FULL_TAG
+ensure_verified_registry_source() {
+	local full_base_image="$1"
+	local line="$2"
+	local image="${full_base_image%:*}"
+	local digest="${VERIFIED_REGISTRY_SOURCE_DIGESTS[$full_base_image]:-}"
 
-	read -r IMAGE BASE_TAG < <(
-		echo "$LINE" | jq -r '[.image, .base_tag] | @tsv'
-	)
-	FULL_BASE_IMAGE="${IMAGE}:${BASE_TAG}"
+	if [[ -z "$digest" ]]; then
+		resolve_registry_tag_digest "$full_base_image" || return 1
+		digest="$REGISTRY_RESOLVED_DIGEST"
+		verify_published_platforms "$line" "${image}@${digest}" || return 1
+		VERIFIED_REGISTRY_SOURCE_DIGESTS["$full_base_image"]="$digest"
+	fi
 
-	# --------------------------------------------------
-	# Apply rolling/channel tags only after every changed base image succeeded.
-	# --------------------------------------------------
-	mapfile -t TAGS < <(echo "$LINE" | jq -r '.tags[]')
+	REGISTRY_SOURCE_REFERENCE="${image}@${digest}"
+}
 
-	for TAG in "${TAGS[@]}"; do
-		FULL_TAG="${IMAGE}:${TAG}"
+promote_planned_alias() {
+	local full_tag="$1"
+	local full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
+	local line="${NEW_ALIAS_RECORD[$full_tag]}"
 
-		# Base tag already applied
-		[[ "$FULL_TAG" == "$FULL_BASE_IMAGE" ]] && continue
+	if [[ "$ALIAS_TOPOLOGY_CHANGED" == "no" ]] && \
+	   [[ -z "${BUILT_IMAGES[$full_base_image]:-}" ]]; then
+		return 0
+	fi
+	if [[ "$BUILD_ONLY" == "yes" ]] && [[ -z "${BUILT_IMAGES[$full_base_image]:-}" ]]; then
+		return 0
+	fi
 
-		echo "  ↪ Tagging $FULL_TAG"
-		if [[ "$DRY_RUN" == "no" ]]; then
-			docker tag "$FULL_BASE_IMAGE" "$FULL_TAG"
-			echo "  ↪ Pushing $FULL_TAG"
-			if [[ "$BUILD_ONLY" == "no" ]]; then
-				docker push "$FULL_TAG"
-			fi
-		fi
-	done
+	echo "  ↪ Promoting $full_tag"
+	[[ "$DRY_RUN" == "no" ]] || return 0
+
+	if [[ "$BUILD_ONLY" == "yes" ]]; then
+		docker tag "$full_base_image" "$full_tag"
+		return 0
+	fi
+
+	ensure_verified_registry_source "$full_base_image" "$line" || return 1
+	docker buildx imagetools create \
+		--tag "$full_tag" \
+		"$REGISTRY_SOURCE_REFERENCE"
 }
 
 # --------------------------------------------------
@@ -823,29 +1575,25 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$BUILD_MANIFEST_FILE"
 
 # --------------------------------------------------
-# publish aliases only after every pending base image was built successfully
+# Reconcile aliases only after every immutable base build and verification
+# succeeded. Topology-only alias changes are promoted without a base rebuild.
 # --------------------------------------------------
-while IFS= read -r line || [[ -n "$line" ]]; do
-	[[ -z "$line" ]] && continue
-	is_pending_build "$line" || continue
+declare -a PLANNED_ALIASES=()
+if [[ "${#NEW_ALIAS_BASE[@]}" -gt 0 ]]; then
+	mapfile -t PLANNED_ALIASES < <(printf '%s\n' "${!NEW_ALIAS_BASE[@]}" | sort)
+fi
 
-	latest=$(echo "$line" | jq -r '.latest')
-	[[ "$latest" == "yes" ]] && continue
+for full_tag in "${PLANNED_ALIASES[@]}"; do
+	[[ "$full_tag" == *:latest ]] && continue
+	promote_planned_alias "$full_tag"
+done
+for full_tag in "${PLANNED_ALIASES[@]}"; do
+	[[ "$full_tag" == *:latest ]] || continue
+	promote_planned_alias "$full_tag"
+done
 
-	publish_image_tags "$line"
-done < "$BUILD_MANIFEST_FILE"
-
-while IFS= read -r line || [[ -n "$line" ]]; do
-	[[ -z "$line" ]] && continue
-	is_pending_build "$line" || continue
-
-	latest=$(echo "$line" | jq -r '.latest')
-	[[ "$latest" == "no" ]] && continue
-
-	publish_image_tags "$line"
-done < "$BUILD_MANIFEST_FILE"
-
-if [[ "$PENDING_BUILD_COUNT" -eq 0 ]]; then
+if [[ "$PENDING_BUILD_COUNT" -eq 0 ]] && \
+   [[ "$BUILD_ONLY" == "yes" || "$PENDING_ALIAS_PROMOTION_COUNT" -eq 0 ]]; then
 	echo "ℹ️  No changed image inputs detected - nothing to build or publish"
 fi
 
@@ -891,9 +1639,21 @@ if [[ "$DRY_RUN" == "no" ]]; then
 		)
 	done
 
+	# Registry alias topology is publication state, so only advance it after
+	# every immutable build, verification, and alias promotion has succeeded.
+	# Local build-only runs preserve the last known registry topology.
+	if [[ "$BUILD_ONLY" == "yes" ]]; then
+		if [[ -n "$OLD_ALIAS_TOPOLOGY_SHA" ]]; then
+			printf 'alias-topology %s\n' "$OLD_ALIAS_TOPOLOGY_SHA" >> "$NEXT_HASHES_FILE"
+		fi
+	else
+		printf 'alias-topology %s\n' "$NEW_ALIAS_TOPOLOGY_SHA" >> "$NEXT_HASHES_FILE"
+	fi
+
 	sort -u "$NEXT_HASHES_FILE" -o "$NEXT_HASHES_FILE"
 	chmod 0644 "$NEXT_HASHES_FILE"
 	mv "$NEXT_HASHES_FILE" "$HASHES_FILE"
+	rm -f -- "$PREVIOUS_BUILD_MANIFEST_FILE"
 	trap - EXIT
 else
 	echo "ℹ️  Build state was not changed during dry-run"

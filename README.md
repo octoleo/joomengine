@@ -14,6 +14,7 @@ Joomla Component Builder Docker images across supported:
 - Joomla versions
 - PHP versions
 - Runtime variants (Apache / FPM / FPM-ALPINE)
+- Linux CPU architectures supplied by each selected official Joomla base image
 - Stable and prerelease channels
 
 All images are **generated, versioned, and published automatically** from
@@ -57,6 +58,11 @@ docker pull octoleo/joomengine:latest
 docker pull octoleo/joomengine:6.1.3
 docker pull octoleo/joomengine:6.1.3-php8.3-apache
 ````
+
+Every tag is a multi-platform Linux image. Docker automatically selects the
+matching image for the host, so the same tags work across all architectures
+supplied by the selected official Joomla base image; architecture-specific
+JoomEngine tags are not required.
 
 [Docker details ->](https://github.com/octoleo/joomengine/blob/master/docker/README.md)
 
@@ -112,8 +118,10 @@ At a high level, the build engine performs the following steps:
 7. **Builds and publishes images**
 
    * Pulls and pins the verified official Joomla base-image digest
+   * Automatically builds every Linux platform supplied by that base image
+   * Publishes each tag as one multi-platform image index
    * Builds only changed base images
-   * Promotes rolling and `latest` aliases only after all base builds succeed
+   * Promotes complete multi-platform rolling and `latest` aliases only after all base builds succeed
    * Pushes images to the registry (unless disabled)
 
 ---
@@ -220,7 +228,7 @@ Rules:
 ├── conf/                           # Declarative data & state
 │   ├── versions.json               # Supported Joomla / PHP / variant matrix
 │   ├── maintainers.json            # Image maintainer metadata
-│   ├── upstream-images.json         # Verified Linux/amd64 Joomla image digests
+│   ├── upstream-images.json         # Verified Joomla image-index/platform state
 │   ├── hashes.txt                  # Tracks built release combinations
 │   └── manifest.ndjson             # (generated) build manifest (NDJSON)
 │
@@ -298,12 +306,14 @@ images receive the same verification and publication path as new Joomla releases
 1. Checks out the repository
 2. Installs required tooling
 3. Runs deterministic unit tests
-4. Authenticates with Docker
-5. Runs `./src/bin/joomengine.sh`
-6. Commits only the generated image contexts and build-state files
+4. Registers cross-architecture emulation and creates a Buildx builder
+5. Authenticates with Docker
+6. Runs `./src/bin/joomengine.sh`
+7. Commits only the generated image contexts and build-state files
 
 Pull requests also run ShellCheck, actionlint, JSON validation, unit tests, and
-representative Apache, FPM, and FPM-Alpine image builds.
+native AMD64 smoke builds for Apache, FPM, and FPM-Alpine, plus an emulated
+ARM64 Apache smoke build.
 
 ### What CI does *not* do
 
@@ -329,11 +339,22 @@ Useful flags:
 -q, --quiet        Suppress all stdout output (exit code only)
 -n, --dry-run      Generate/review contexts without building or changing hashes
 -f, --force        Force update docker folder/files
-    --build-only   Build images locally, do not push
+    --build-only   Build and load one platform locally, do not push
+    --platforms    Use auto or an explicit comma-separated platform list
 -h, --help         Show this help and exit
 ```
 
-This makes local testing identical to CI behavior.
+Normal publication defaults to `--platforms auto`, which uses the complete
+platform set verified for each official Joomla base image. `--build-only`
+loads one platform into the local Docker image store, defaulting to the host
+platform. Use an explicit single-platform override when needed, for example:
+
+```bash
+./src/bin/joomengine.sh --build-only --platforms linux/arm64/v8
+```
+
+For publication or focused diagnostics, `--platforms` can also override the
+automatic selection with an explicit comma-separated list.
 
 ---
 

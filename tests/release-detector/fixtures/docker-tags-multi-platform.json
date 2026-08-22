@@ -1,0 +1,79 @@
+{
+	"results": [
+		{
+			"name": "4.4.14-php8.1-apache",
+			"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			"images": [
+				{
+					"architecture": "unknown",
+					"os": "unknown",
+					"status": "active",
+					"digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+				},
+				{
+					"architecture": "ppc64le",
+					"os": "linux",
+					"status": "active",
+					"digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+				},
+				{
+					"architecture": "arm",
+					"variant": "v8",
+					"os": "linux",
+					"status": "active",
+					"digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+				},
+				{
+					"architecture": "riscv64",
+					"os": "linux",
+					"status": "inactive",
+					"digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+				},
+				{
+					"architecture": "i386",
+					"os": "linux",
+					"status": "active",
+					"digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+				},
+				{
+					"architecture": "arm",
+					"variant": "5",
+					"os": "linux",
+					"status": "active",
+					"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+				},
+				{
+					"architecture": "x86_64",
+					"os": "LINUX",
+					"status": "ACTIVE",
+					"digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				},
+				{
+					"architecture": "amd64",
+					"os": "windows",
+					"status": "active",
+					"digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+				},
+				{
+					"architecture": "arm",
+					"variant": "v7",
+					"os": "linux",
+					"status": "active",
+					"digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+				}
+			]
+		},
+		{
+			"name": "4.4.15-php8.1-apache",
+			"digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+			"images": [
+				{"architecture": "amd64", "os": "linux", "status": "active", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+				{"architecture": "arm", "variant": "v5", "os": "linux", "status": "active", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+				{"architecture": "arm", "variant": "v7", "os": "linux", "status": "active", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+				{"architecture": "arm64", "variant": "v8", "os": "linux", "status": "active", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"},
+				{"architecture": "386", "os": "linux", "status": "active", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+				{"architecture": "ppc64le", "os": "linux", "status": "active", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"}
+			]
+		}
+	]
+}
