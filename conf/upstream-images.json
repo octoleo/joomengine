@@ -211,7 +211,7 @@
 			}
 		},
 		"6.1.3-php8.4-fpm": {
-			"index_digest": "sha256:fb19e6f8e95f17ce591ad514d8acadcc97bd8062010cbe5cd5d66aaa4741fca9",
+			"index_digest": "sha256:e26d7e6ccd96cddd3636fc92045702a09cbe1173b100425f7ff945ae74649b82",
 			"platforms": {
 				"linux/386": "sha256:ca944e2bd7f4d5625bb121e2fb648c3028e2165dd0a14623209dcb33ed84d85f",
 				"linux/amd64": "sha256:a8882511818832318e8af9cb88d967ade439b1c93dfb2b7b167e691f21d85f44",
@@ -219,12 +219,12 @@
 				"linux/arm/v7": "sha256:777226209c080c8eee160bb10cc2677300bd3cce96cc8b51a0d108a912b08cc2",
 				"linux/arm64/v8": "sha256:417affd6abc3134418b9859c032204e7c8b850b5201c69ba22222d815e37f0c5",
 				"linux/ppc64le": "sha256:7118623db00900d576d2f3446f6b3ec2de10125b0b22ce0b232104b3c437a1ff",
-				"linux/riscv64": "sha256:a6aa87e8971bcc6dcec1aa66da5e803dab5629ac9d0b2322f8e303913751ba18",
+				"linux/riscv64": "sha256:2aa2d83e869046d73f769e04ae321075597e1f4c938883914b310b3a87517492",
 				"linux/s390x": "sha256:f9d73b2e9956b3339474800dfba0301c31a4f85bb0ed55e79d286215508aa3e2"
 			}
 		},
 		"6.1.3-php8.4-fpm-alpine": {
-			"index_digest": "sha256:66ee11e8c9d6c7740bf044f8a8970996770dce430d7482efaeb1f8f137407349",
+			"index_digest": "sha256:13a6857a028332b32636ea05d4d28d7d6dc07a708e767af4e1649a898bb17586",
 			"platforms": {
 				"linux/386": "sha256:b63be88a4b9052fdaee04c95010c0821776f7be89433a953389db5e48be9505e",
 				"linux/amd64": "sha256:9cb7587d4f66771893188e8fda7cfbe95523d96476f46c6dabd6fa9d30ee2f13",
@@ -232,7 +232,7 @@
 				"linux/arm/v7": "sha256:b3c1c56b0c98ad01c510d49d7ae33ee1e9e447be017419a6611070f3eebe7e65",
 				"linux/arm64/v8": "sha256:900fbf7fa7491201f8cb09838cb11d4e7b9eebf4bab6ff9b603d921f1286d63e",
 				"linux/ppc64le": "sha256:e093a3b4dc71b6222d21bd1bcc0ce354f58e8ec96dc4d8ae3665398022dbf5b9",
-				"linux/riscv64": "sha256:77cdda552b513ada3dab0fc6f214dade8d4c81b396d775d18683d53d51adede5",
+				"linux/riscv64": "sha256:31d6ec89ce953b820aea54b80094fbedc1315b2a79aae253b127a53f9e3c1363",
 				"linux/s390x": "sha256:a3a00321fe482f5f7ac45945af5da414444b85692edbccba2c110f50d5e48e3b"
 			}
 		}
