@@ -53,6 +53,36 @@ architectures supplied by its selected official Joomla base image. Docker
 automatically pulls the matching architecture for the host, so the commands
 above stay the same on AMD64, ARM64, and the other supported platforms.
 
+### Include the MCP component and plugins
+
+Use the explicit `-mcp` suffix:
+
+```bash
+docker pull octoleo/joomengine:6-php8.3-apache-mcp
+docker pull octoleo/joomengine:6-php8.4-fpm-mcp
+docker pull octoleo/joomengine:latest-mcp
+```
+
+Standard tags, including `latest`, do not bundle MCP. MCP variants are published
+only for Joomla 6+ and PHP versions allowed by the latest stable package's update
+XML. The initial package requires Joomla 6.1+ within 6.x and PHP 8.3.0+. The version
+at the start of an image tag is the JCB version, not the MCP package version.
+
+The package ZIP contains the MCP component, console plugin, and webservices plugin.
+Its URL and SHA-512 are pinned when building the image, and the complete archive
+must pass verification. First deployment installs that local archive after JCB.
+MCP images expose their selected package version and hash in image metadata.
+The `-mcp` tags can move when MCP is updated; pin an image digest for identical
+repeated deployments.
+
+Installation is scoped to fresh Joomla bootstrap. If the local MCP ZIP is absent,
+startup skips MCP. A failed MCP installation stops startup and records a pending
+installation in the persistent Joomla tree so the next start retries it. A
+successful installation is recorded and ordinary restarts do not repeat it.
+Changing an image tag on an already configured site does not install or upgrade
+MCP automatically; use Joomla's extension installation/update process for that
+existing site. New volumes receive the package bundled in their selected image.
+
 ---
 
 ## 🧩 How It Works (Runtime Behavior)
@@ -67,6 +97,7 @@ When the container starts:
 3. Once Joomla is configured (`configuration.php` exists):
    * Optional extensions are installed from URLs or paths
    * **Joomla Component Builder is installed automatically**
+   * The bundled **MCP package is installed after JCB**, if present in an MCP image
    * SMTP configuration is applied (if provided)
    * Optional Joomla CLI commands are executed
 4. The complete Joomla tree is recursively repaired to the web-worker UID:GID

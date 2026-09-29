@@ -66,6 +66,40 @@ JoomEngine tags are not required.
 
 [Docker details ->](https://github.com/octoleo/joomengine/blob/master/docker/README.md)
 
+### Optional JoomEngine MCP images
+
+Append `-mcp` to a supported tag to include the JoomEngine MCP package:
+
+```bash
+docker pull octoleo/joomengine:6-php8.3-apache-mcp
+docker pull octoleo/joomengine:6-mcp
+docker pull octoleo/joomengine:latest-mcp
+```
+
+Tags without this suffix, including `latest`, contain JCB without MCP. The tag's
+leading version identifies JCB; the Joomla base version is recorded in the build
+manifest and image labels. Apache, FPM, and FPM-Alpine each receive MCP counterparts
+only when their Joomla and PHP versions meet the package's update XML constraints.
+
+The build resolves the highest stable MCP package once from its
+[authoritative update XML](https://raw.githubusercontent.com/joomengine/mcp_package/refs/heads/main/.github/joomengine_mcp_update_server.xml).
+At introduction, that is package 1.0.1, requiring PHP 8.3.0 and Joomla 6.1+ within
+6.x. Joomla 6.0, Joomla 5, and Joomla 7 are not eligible under that XML. Eligibility
+is read from the selected release on every build rather than hardcoded to these
+current requirements; Joomla versions below 6 never receive MCP variants.
+
+The package version is not another tag dimension. Every `-mcp` tag follows the
+latest stable MCP at build time, while the image records the exact version, URL,
+and SHA-512. Missing metadata or a failed archive checksum aborts the build.
+Container startup uses only the verified local ZIP; it does not fetch releases.
+Pin the resulting image digest when a deployment must use identical image bytes.
+
+MCP contexts use a separate `variant-mcp/` directory, manifest row, and successful
+build record. MCP metadata changes rebuild MCP images without rebuilding standard
+images. The manifest's `flavor` is `standard` or `mcp`; `mcp` holds the selected
+package metadata or `null`. The `latest` flag belongs to the standard image, and
+`latest_mcp` identifies the MCP counterpart.
+
 ---
 
 ## 🏗️ How Images Are Built
@@ -289,7 +323,8 @@ Every six hours, the release poller:
 2. Checks every configured PHP × variant tag on the official Joomla Docker Hub repository
 3. Waits successfully, without a repository change or failed workflow, while any candidate tag is unavailable
 4. Atomically updates `conf/versions.json` and `conf/upstream-images.json` only when a complete matrix is ready
-5. Dispatches the normal image publisher only when a version or tracked digest changed
+5. Checks the latest stable MCP package against eligible images and successful build records
+6. Dispatches the normal image publisher when Joomla inputs changed or MCP images need rebuilding
 
 Digest-only changes are deliberate rebuild triggers, so refreshed upstream base
 images receive the same verification and publication path as new Joomla releases.
@@ -297,6 +332,7 @@ images receive the same verification and publication path as new Joomla releases
 ### Build triggers
 
 * A JCB release dispatch
+* An MCP release dispatch (`pkg-joomengine-mcp-updated`), or detection by the six-hour poll
 * A build-input change merged to `master`
 * A ready Joomla version or official base-image digest change
 * Manual dispatch
@@ -311,9 +347,12 @@ images receive the same verification and publication path as new Joomla releases
 6. Runs `./src/bin/joomengine.sh`
 7. Commits only the generated image contexts and build-state files
 
-Pull requests also run ShellCheck, actionlint, JSON validation, unit tests, and
-native AMD64 smoke builds for Apache, FPM, and FPM-Alpine, plus an emulated
-ARM64 Apache smoke build.
+Pull requests also run ShellCheck, actionlint, JSON validation, and deterministic
+tests for release selection, compatibility, build state, tags, and startup. Image
+smoke gates render fresh Dockerfiles from the submitted template and build standard
+and MCP images for native AMD64 Apache, FPM, and FPM-Alpine, plus emulated ARM64
+Apache. Native Apache tests deploy Joomla against MariaDB, verify installed
+extensions, and restart the container to check one-time installation behavior.
 
 ### What CI does *not* do
 

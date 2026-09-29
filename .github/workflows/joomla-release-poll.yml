@@ -1,4 +1,4 @@
-name: Joomla – Stable Release Poll
+name: Joomla and MCP – Stable Release Poll
 
 on:
   schedule:
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   poll:
-    name: Check Joomla and official Docker tags
+    name: Check Joomla, official Docker tags, and MCP
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -39,6 +39,8 @@ jobs:
           missing=()
           command -v curl >/dev/null 2>&1 || missing+=(curl)
           command -v jq >/dev/null 2>&1 || missing+=(jq)
+          command -v xmlstarlet >/dev/null 2>&1 || missing+=(xmlstarlet)
+          command -v gawk >/dev/null 2>&1 || missing+=(gawk)
 
           if [[ "${#missing[@]}" -gt 0 ]]; then
             sudo apt-get update
@@ -104,8 +106,15 @@ jobs:
           git rebase "origin/$DEFAULT_BRANCH"
           git push origin "HEAD:$DEFAULT_BRANCH"
 
+      - name: Check latest stable MCP package
+        id: mcp
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./src/bin/check-mcp-release.sh
+
       - name: Trigger normal image build workflow
-        if: steps.releases.outputs.changed == 'yes'
+        if: steps.releases.outputs.changed == 'yes' || steps.mcp.outputs.changed == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -127,16 +136,20 @@ jobs:
           DIGESTS_CHANGED: ${{ steps.releases.outputs.digests_changed }}
           UPDATED_MAJORS: ${{ steps.releases.outputs.updated_majors }}
           WAITING_MAJORS: ${{ steps.releases.outputs.waiting_majors }}
+          MCP_CHANGED: ${{ steps.mcp.outputs.changed }}
+          MCP_VERSION: ${{ steps.mcp.outputs.mcp_version }}
         shell: bash
         run: |
           set -euo pipefail
 
           {
-            echo "## Joomla stable release poll"
+            echo "## Joomla and MCP stable release poll"
             echo
             echo "- Repository state changed: ${CHANGED:-no}"
             echo "- Joomla versions changed: ${VERSIONS_CHANGED:-no}"
             echo "- Base image digests changed: ${DIGESTS_CHANGED:-no}"
             echo "- Updated majors: ${UPDATED_MAJORS:-none}"
             echo "- Waiting for Docker tags: ${WAITING_MAJORS:-none}"
+            echo "- MCP image rebuild needed: ${MCP_CHANGED:-no}"
+            echo "- Latest stable MCP package: ${MCP_VERSION:-unavailable}"
           } >> "$GITHUB_STEP_SUMMARY"

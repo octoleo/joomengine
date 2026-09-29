@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck xmlstarlet gawk
 
       - name: Validate shell scripts
         shell: bash
@@ -86,31 +86,102 @@ jobs:
           tar --no-same-owner -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-  image-smoke:
-    name: Image smoke (${{ matrix.variant }}, ${{ matrix.platform }})
+  generate-contexts:
+    name: Generate smoke contexts from current templates
     needs: static-and-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install generation tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq xmlstarlet gawk
+
+      - name: Generate without building or publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          src/bin/joomengine.sh --dry-run --force
+
+      - name: Select standard and MCP contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          destination=quality-contexts
+          mkdir -p "$destination/images"
+          : > "$destination/manifest.ndjson"
+
+          for flavor in standard mcp; do
+            anchor="$(
+              jq -scer --arg flavor "$flavor" '
+                [.[] | select(.flavor == $flavor and
+                  (if $flavor == "mcp" then .latest_mcp else .latest end) == "yes")]
+                | if length == 1 then .[0] else error("Missing or ambiguous latest " + $flavor) end
+              ' conf/manifest.ndjson
+            )"
+            for variant in apache fpm fpm-alpine; do
+              record="$(
+                jq -scer --argjson anchor "$anchor" --arg variant "$variant" '
+                  [.[] | select(.version == $anchor.version and .joomla == $anchor.joomla and
+                    .php == $anchor.php and .flavor == $anchor.flavor and .variant == $variant)]
+                  | if length == 1 then .[0] else error("Missing or ambiguous context") end
+                ' conf/manifest.ndjson
+              )"
+              context="$(jq -er '.context' <<< "$record")"
+              test -f "images/$context/Dockerfile"
+              test -f "images/$context/docker-entrypoint.sh"
+              mkdir -p "$destination/images/$context"
+              cp "images/$context/Dockerfile" "images/$context/docker-entrypoint.sh" \
+                "$destination/images/$context/"
+              printf '%s\n' "$record" >> "$destination/manifest.ndjson"
+            done
+          done
+          jq -se 'length == 6' "$destination/manifest.ndjson" >/dev/null
+
+      - name: Share the exact generated build inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-smoke-contexts
+          path: quality-contexts/
+          if-no-files-found: error
+          retention-days: 7
+
+  image-smoke:
+    name: Image smoke (${{ matrix.flavor }}, ${{ matrix.variant }}, ${{ matrix.platform }})
+    needs: generate-contexts
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
+        flavor: [standard, mcp]
+        variant: [apache, fpm, fpm-alpine]
+        platform: [linux/amd64]
+        architecture: [amd64]
         include:
-          - variant: apache
-            platform: linux/amd64
-            architecture: amd64
-          - variant: fpm
-            platform: linux/amd64
-            architecture: amd64
-          - variant: fpm-alpine
-            platform: linux/amd64
-            architecture: amd64
-          - variant: apache
+          - flavor: standard
+            variant: apache
+            platform: linux/arm64/v8
+            architecture: arm64
+          - flavor: mcp
+            variant: apache
             platform: linux/arm64/v8
             architecture: arm64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download generated contexts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: image-smoke-contexts
+          path: quality-contexts
 
       - name: Set up QEMU
         if: matrix.architecture != 'amd64'
@@ -132,36 +203,22 @@ jobs:
         id: context
         env:
           VARIANT: ${{ matrix.variant }}
+          FLAVOR: ${{ matrix.flavor }}
+          PLATFORM: ${{ matrix.platform }}
         shell: bash
         run: |
           set -euo pipefail
-          version="$(jq -r 'select(.latest == "yes") | .version' conf/manifest.ndjson)"
-          php_version="$(jq -r 'select(.latest == "yes") | .php' conf/manifest.ndjson)"
-          context="$(
-            jq -r \
-              --arg version "$version" \
-              --arg php "$php_version" \
-              --arg variant "$VARIANT" \
-              'select(
-                .version == $version and
-                .php == $php and
-                .variant == $variant
-              ) | .context' \
-              conf/manifest.ndjson |
-              head -n 1
+          record="$(
+            jq -scer --arg flavor "$FLAVOR" --arg variant "$VARIANT" '
+              [.[] | select(.flavor == $flavor and .variant == $variant)]
+              | if length == 1 then .[0] else error("Missing or ambiguous smoke context") end
+            ' quality-contexts/manifest.ndjson
           )"
-
-          [[ -n "$context" ]] || {
-            echo "No representative context found for $VARIANT" >&2
-            exit 1
-          }
-          [[ -f "images/$context/Dockerfile" ]] || {
-            echo "Missing generated Dockerfile: images/$context/Dockerfile" >&2
-            exit 1
-          }
-
-          cp src/docker/docker-entrypoint.sh "images/$context/docker-entrypoint.sh"
-          echo "path=images/$context" >> "$GITHUB_OUTPUT"
+          jq -e --arg platform "$PLATFORM" '.base_platforms | has($platform)' <<< "$record" >/dev/null
+          context="$(jq -er '.context' <<< "$record")"
+          test -f "quality-contexts/images/$context/Dockerfile"
+          echo "path=quality-contexts/images/$context" >> "$GITHUB_OUTPUT"
+          echo "image=joomengine-smoke:$FLAVOR-$VARIANT-${{ matrix.architecture }}" >> "$GITHUB_OUTPUT"
 
       - name: Build representative image
         shell: bash
@@ -171,15 +228,32 @@ jobs:
             --load \
             --platform "${{ matrix.platform }}" \
             --pull \
-            --tag "joomengine-smoke:${{ matrix.variant }}-${{ matrix.architecture }}" \
+            --tag "${{ steps.context.outputs.image }}" \
             "${{ steps.context.outputs.path }}"
 
-      - name: Validate packaged entrypoint
+      - name: Validate packaged entrypoint and verified archives
+        env:
+          FLAVOR: ${{ matrix.flavor }}
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
             --platform "${{ matrix.platform }}" \
             --entrypoint bash \
-            "joomengine-smoke:${{ matrix.variant }}-${{ matrix.architecture }}" \
-            -n /entrypoint.sh
+            --env "SMOKE_FLAVOR=$FLAVOR" \
+            "${{ steps.context.outputs.image }}" -euc '
+              bash -n /entrypoint.sh
+              printf "%s  %s\n" "$JCB_SHA512" /usr/src/joomengine/jcb.zip | sha512sum -c -
+              if [[ "$SMOKE_FLAVOR" == mcp ]]; then
+                test -n "$MCP_VERSION"
+                printf "%s  %s\n" "$MCP_SHA512" /usr/src/joomengine/mcp.zip | sha512sum -c -
+              else
+                test ! -e /usr/src/joomengine/mcp.zip
+                test -z "${MCP_VERSION:-}${MCP_SHA512:-}${MCP_PACKAGE:-}"
+              fi
+            '
+
+      - name: Verify first deployment and restart against MariaDB
+        if: matrix.variant == 'apache' && matrix.architecture == 'amd64'
+        shell: bash
+        run: tests/image-smoke-test.sh "${{ steps.context.outputs.image }}" "${{ matrix.flavor }}"

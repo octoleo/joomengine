@@ -2,7 +2,7 @@ name: JoomEngine – Automated Build & Version Tracking
 
 on:
   repository_dispatch:
-    types: [pkg-component-builder-updated]
+    types: [pkg-component-builder-updated, pkg-joomengine-mcp-updated]
 
   workflow_dispatch:
 
@@ -12,6 +12,7 @@ on:
       - ".github/workflows/joomengine.yml"
       - "conf/maintainers.json"
       - "src/bin/joomengine.sh"
+      - "src/lib/**"
       - "src/docker/**"
 
 permissions:
