@@ -1,6 +1,10 @@
 {{
 	def is_apache:
-		env.VARIANT == "apache"
+		env.VARIANT == "apache";
+	def is_mcp:
+		env.IMAGE_FLAVOR == "mcp";
+	def mcp:
+		env.IMAGE_MCP_METADATA | fromjson
 -}}
 # -----------------------------------------------------------------------------
 # Official JCB v{{ env.JCB_VERSION }} image: extend the official Joomla! v{{ env.JOOMLA_VERSION }} image
@@ -10,7 +14,7 @@ FROM joomla:{{ env.JOOMLA_VERSION }}-php{{ env.PHP_VERSION }}-{{ env.VARIANT }}@
 # Metadata
 LABEL maintainer="{{ env.MAINTAINERS }}"
 LABEL org.opencontainers.image.title="Joomla! Component Builder - JoomEngine"
-LABEL org.opencontainers.image.description="Joomla! v{{ env.JOOMLA_VERSION }} + Component Builder v{{ env.JCB_VERSION }}"
+LABEL org.opencontainers.image.description="Joomla! v{{ env.JOOMLA_VERSION }} + Component Builder v{{ env.JCB_VERSION }}{{ if is_mcp then " + JoomEngine MCP v" + mcp.version else "" end }}"
 LABEL org.opencontainers.image.version="{{ env.JCB_VERSION }}"
 LABEL org.opencontainers.image.source="https://github.com/octoleo/joomengine"
 LABEL org.opencontainers.image.base.name="docker.io/library/joomla:{{ env.JOOMLA_VERSION }}-php{{ env.PHP_VERSION }}-{{ env.VARIANT }}"
@@ -33,6 +37,23 @@ RUN set -eux; \
 	echo "$JCB_SHA512  $JCB_INSTALL_DIR/jcb.zip" | sha512sum -c -; \
 	chown -R www-data:www-data "$JCB_INSTALL_DIR"
 
+{{ if is_mcp then ( -}}
+# -----------------------------------------------------------------------------
+# Optional JoomEngine MCP package (component and plugins, pinned at image build)
+# -----------------------------------------------------------------------------
+LABEL org.joomengine.mcp.version="{{ mcp.version }}"
+LABEL org.joomengine.mcp.sha512="{{ mcp.sha512 }}"
+LABEL org.joomengine.mcp.source="{{ mcp.url }}"
+ENV MCP_VERSION={{ mcp.version }}
+ENV MCP_SHA512={{ mcp.sha512 }}
+ENV MCP_PACKAGE={{ mcp.url }}
+
+RUN set -eux; \
+	curl -fSL "$MCP_PACKAGE" -o "$JCB_INSTALL_DIR/mcp.zip"; \
+	echo "$MCP_SHA512  $JCB_INSTALL_DIR/mcp.zip" | sha512sum -c -; \
+	chown www-data:www-data "$JCB_INSTALL_DIR/mcp.zip"
+
+{{ ) else "" end -}}
 # -----------------------------------------------------------------------------
 # JCB entrypoint
 # -----------------------------------------------------------------------------

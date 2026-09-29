@@ -58,6 +58,12 @@ mcp_resolve_package() (
 	local package_json='' candidate_json input_sha
 	local -a latest_indices=()
 	[[ -f "$xml_file" ]] || { _mcp_error "update XML is not a file: $xml_file"; return 2; }
+	# NUL-bearing XML encodings could conceal declaration keywords from the byte
+	# check below. Update metadata must use a text encoding without embedded NULs.
+	if LC_ALL=C grep -aPq '\x00' "$xml_file"; then
+		_mcp_error 'NUL-bearing XML encodings are not permitted'
+		return 2
+	fi
 	# Do not permit remote or local entity expansion while reading update metadata.
 	if LC_ALL=C grep -Eq '<![[:space:]]*(DOCTYPE|ENTITY)' "$xml_file"; then
 		_mcp_error 'DTD and entity declarations are not permitted'

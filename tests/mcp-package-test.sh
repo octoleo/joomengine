@@ -126,6 +126,8 @@ printf '<updates><update>\n' > "$TEST_TMP/updates.xml"
 assert_status 2 mcp_resolve_package "$TEST_TMP/updates.xml"
 printf '<!DOCTYPE updates [<!ENTITY metadata "ignored">]><updates/>\n' > "$TEST_TMP/updates.xml"
 assert_status 2 mcp_resolve_package "$TEST_TMP/updates.xml"
+printf '\377\376<\000!\000D\000O\000C\000T\000Y\000P\000E\000' > "$TEST_TMP/updates.xml"
+assert_status 2 mcp_resolve_package "$TEST_TMP/updates.xml"
 update 2.0.0-rc1 stable | fixture
 assert_status 2 mcp_resolve_package "$TEST_TMP/updates.xml"
 update 2.0.0 beta | fixture

@@ -72,6 +72,7 @@ if [[ "${JOOMENGINE_BUILD_TEST_MOCK:-no}" == "yes" ]]; then
 	case "${0##*/}" in
 	curl)
 		output=""
+		url=""
 		while [[ $# -gt 0 ]]; do
 			case "$1" in
 			-o|--output)
@@ -79,21 +80,36 @@ if [[ "${JOOMENGINE_BUILD_TEST_MOCK:-no}" == "yes" ]]; then
 				shift 2
 				;;
 			*)
+				url="$1"
 				shift
 				;;
 			esac
 		done
 		[[ -n "$output" ]] || exit 2
-		printf '<updates/>\n' > "$output"
+		if [[ "$url" == *joomengine_mcp_update_server.xml ]]; then
+			cp "$JOOMENGINE_MCP_XML_FILE" "$output"
+			printf 'fetch\n' >> "$JOOMENGINE_MCP_FETCH_TRACE"
+		else
+			jcb_major="${url%/componentbuilder_update_server.xml}"
+			jcb_major="${jcb_major##*/}"
+			printf '<updates jcb-major="%s"/>\n' "${jcb_major%.x}" > "$output"
+		fi
 		;;
 	xmlstarlet)
+		if grep -Fq 'pkg_joomengine_mcp' "${!#}"; then
+			exec "$JOOMENGINE_REAL_XMLSTARLET" "$@"
+		fi
 		jcb_url="$(<"$JOOMENGINE_JCB_URL_FILE")"
+		jcb_major="$(sed -n 's/.*jcb-major="\([0-9][0-9]*\)".*/\1/p' "${!#}")"
 		printf '%s\n' \
-			"6.0.0|${jcb_url}|stable|$(printf 'a%.0s' {1..128})"
+			"${jcb_major}.0.0|${jcb_url}|stable|$(printf 'a%.0s' {1..128})"
 		;;
 	gawk)
 		printf 'FROM joomla:%s-php%s-%s@%s\n' \
 			"$JOOMLA_VERSION" "$PHP_VERSION" "$VARIANT" "$BASE_IMAGE_INDEX_DIGEST"
+		if [[ "$IMAGE_FLAVOR" == "mcp" ]]; then
+			jq -r '"ENV MCP_VERSION=" + .version, "ENV MCP_SHA512=" + .sha512' <<< "$IMAGE_MCP_METADATA"
+		fi
 		;;
 	docker)
 		printf '%s\n' "$*" >> "$JOOMENGINE_DOCKER_TRACE"
@@ -201,9 +217,11 @@ mkdir -p \
 	"$CASE_DIR/images/jcb6.0.0/j6.0.0/php8.4/apache" \
 	"$CASE_DIR/log" \
 	"$CASE_DIR/src/bin" \
+	"$CASE_DIR/src/lib" \
 	"$CASE_DIR/src/docker"
 
 cp "$ENGINE" "$CASE_DIR/src/bin/joomengine.sh"
+cp "$REPO_ROOT/src/lib/mcp-package.sh" "$CASE_DIR/src/lib/mcp-package.sh"
 cp "$REPO_ROOT/src/docker/Dockerfile.template" "$CASE_DIR/src/docker/Dockerfile.template"
 cp "$REPO_ROOT/src/docker/docker-entrypoint.sh" "$CASE_DIR/src/docker/docker-entrypoint.sh"
 printf '# deterministic jq template fixture\n' > "$CASE_DIR/bashbrew/jq-template.awk"
@@ -211,6 +229,21 @@ printf 'obsolete context\n' > "$CASE_DIR/images/jcb6.0.0/j6.0.0/php8.4/apache/ob
 printf 'https://example.test/com_componentbuilder.zip\n' > "$CASE_DIR/jcb-url"
 printf '[]\n' > "$CASE_DIR/conf/maintainers.json"
 printf 'obsolete build record\n' > "$CASE_DIR/conf/hashes.txt"
+export JOOMENGINE_MCP_XML_FILE="$CASE_DIR/mcp-update.xml"
+export JOOMENGINE_MCP_FETCH_TRACE="$CASE_DIR/mcp-fetch.trace"
+JOOMENGINE_REAL_XMLSTARLET="$(command -v xmlstarlet)"
+export JOOMENGINE_REAL_XMLSTARLET
+
+cat > "$JOOMENGINE_MCP_XML_FILE" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<updates><update>
+  <name>JoomEngine MCP</name><element>pkg_joomengine_mcp</element><type>package</type>
+  <version>1.0.1</version><tags><tag>stable</tag></tags>
+  <downloads><downloadurl type="full" format="zip">https://example.test/pkg_joomengine_mcp-1.0.1.zip</downloadurl></downloads>
+  <sha512>$(printf 'b%.0s' {1..128})</sha512>
+  <php_minimum>8.3.0</php_minimum><targetplatform name="joomla" version="6\.[1-9][0-9]*"/>
+</update></updates>
+XML
 
 cat > "$CASE_DIR/conf/versions.json" <<'JSON'
 {
@@ -266,6 +299,7 @@ set_alias_topology_hash() {
 
 run_engine_args() {
 	: > "$TRACE_FILE"
+	: > "$JOOMENGINE_MCP_FETCH_TRACE"
 	if ! JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 	JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
@@ -305,7 +339,18 @@ jq -e '
 	(.base_platforms | keys) == ["linux/amd64", "linux/arm/v5", "linux/arm64/v8"]
 ' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'manifest omitted multi-platform provenance'
 [[ ! -d "$CASE_DIR/images/jcb6.0.0/j6.0.0" ]] || fail 'stale Joomla context was not pruned'
-[[ "$(wc -l < "$CASE_DIR/conf/hashes.txt")" -eq 1 ]] || fail 'current hash state was not compact'
+[[ "$(wc -l < "$CASE_DIR/conf/hashes.txt")" -eq 2 ]] || fail 'current hash state did not retain exactly both image flavors'
+[[ "$(wc -l < "$JOOMENGINE_MCP_FETCH_TRACE")" -eq 1 ]] || fail 'MCP metadata was fetched more than once for the batch'
+jq -s -e '
+	length == 2 and
+	(map(.flavor) | sort) == ["mcp", "standard"] and
+	([.[] | select(.flavor == "standard")][0] | .mcp == null and .latest == "yes" and .latest_mcp == "no" and all(.tags[]; endswith("-mcp") | not)) and
+	([.[] | select(.flavor == "mcp")][0] | .mcp.version == "1.0.1" and .latest == "no" and .latest_mcp == "yes" and all(.tags[]; endswith("-mcp"))) and
+	([.[] | .tags[]] | length) == ([.[] | .tags[]] | unique | length) and
+	([.[] | select(.flavor == "standard") | .tags[] + "-mcp"] | sort) == ([.[] | select(.flavor == "mcp") | .tags[]] | sort)
+' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'MCP image tags or provenance are missing, duplicated, or mixed into plain images'
+assert_not_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache/Dockerfile" 'MCP_VERSION'
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-mcp/Dockerfile" 'MCP_VERSION=1.0.1'
 echo 'ok - local auto mode loads one host image pinned to the verified index digest'
 
 first_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
@@ -314,6 +359,21 @@ run_engine
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$first_hashes" ]] || fail 'no-op changed hash state'
 assert_contains "$CASE_DIR/engine.out" 'No changed image inputs detected'
 echo 'ok - unchanged inputs are a true build no-op'
+
+plain_hash="$(awk '$11 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")"
+sed -i 's/1\.0\.1/1.0.2/g' "$JOOMENGINE_MCP_XML_FILE"
+run_engine
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 1 ]] || fail 'MCP release change rebuilt plain images'
+assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --load'
+[[ "$(awk '$11 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$plain_hash" ]] || fail 'MCP release change altered the standard image fingerprint'
+echo 'ok - MCP releases rebuild only explicitly suffixed MCP images'
+
+printf '# resolver implementation change\n' >> "$CASE_DIR/src/lib/mcp-package.sh"
+run_engine
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 1 ]] || fail 'MCP helper change rebuilt plain images'
+assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --load'
+[[ "$(awk '$11 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$plain_hash" ]] || fail 'MCP helper change altered the standard image fingerprint'
+echo 'ok - resolver changes invalidate MCP fingerprints without changing plain images'
 
 printf '# entrypoint change\n' >> "$CASE_DIR/src/docker/docker-entrypoint.sh"
 run_engine
@@ -465,6 +525,9 @@ assert_command_before "$TRACE_FILE" 'buildx build --pull' 'buildx imagetools cre
 assert_command_before "$TRACE_FILE" 'imagetools inspect --format {{json .Manifest}}' 'buildx imagetools inspect --raw'
 assert_command_before "$TRACE_FILE" 'buildx build --pull' 'buildx imagetools inspect --raw'
 assert_command_before "$TRACE_FILE" 'buildx imagetools inspect --raw' 'buildx imagetools create'
+assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --metadata-file' 'buildx imagetools create'
+[[ "$(tail -2 "$TRACE_FILE" | sed -n '1p')" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || fail 'plain latest was not deferred until all other aliases'
+[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest-mcp $PUBLISHED_REFERENCE" ]] || fail 'MCP latest was not deferred until all other aliases'
 jq -e '
 	.platforms == ["linux/386", "linux/amd64", "linux/arm/v5", "linux/arm64/v8"] and
 	.platform_digests == .base_platforms
@@ -621,3 +684,68 @@ fi
 assert_contains "$CASE_DIR/engine.err" 'Conflicting previous alias ownership'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$topology_hashes" ]] || fail 'alias conflict changed hash state'
 echo 'ok - conflicting alias ownership fails before any Docker mutation'
+
+# Generate a mixed compatibility matrix. Only the PHP minimum and Joomla target
+# from the update metadata decide which base runtimes receive MCP counterparts.
+rm "$CASE_DIR/conf/manifest.ndjson"
+jq '."6".php = ["8.2", "8.3", "8.4"] | ."6".variants = ["apache", "fpm", "fpm-alpine"]' \
+	"$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+jq '.tags["6.1.3-php8.4-apache"] as $base |
+	.tags = ([ ["8.2", "8.3", "8.4"][] as $php |
+		["apache", "fpm", "fpm-alpine"][] as $variant |
+		{key: ("6.1.3-php" + $php + "-" + $variant), value: $base} ] | from_entries)' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+matrix_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
+run_engine_args --dry-run
+[[ ! -s "$TRACE_FILE" ]] || fail 'compatibility dry-run invoked Docker'
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$matrix_hashes" ]] || fail 'compatibility dry-run changed published state'
+jq -s -e '
+	length == 15 and
+	([.[] | select(.flavor == "standard")] | length) == 9 and
+	([.[] | select(.flavor == "mcp")] | length) == 6 and
+	all(.[] | select(.flavor == "mcp"); .php == "8.3" or .php == "8.4") and
+	([.[] | select(.flavor == "mcp") | .variant] | unique) == ["apache", "fpm", "fpm-alpine"] and
+	([.[] | .tags[]] | length) == ([.[] | .tags[]] | unique | length)
+' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'PHP compatibility or variant suffix generation was incorrect'
+[[ "$(wc -l < "$JOOMENGINE_MCP_FETCH_TRACE")" -eq 1 ]] || fail 'matrix fetched MCP once per context instead of once per batch'
+echo 'ok - mixed PHP and Apache/FPM variants receive only eligible, uniquely suffixed counterparts'
+
+cp "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/versions.matrix"
+cp "$CASE_DIR/conf/upstream-images.json" "$CASE_DIR/conf/upstream-images.matrix"
+jq '."7" = {php: ["8.4"], joomla: "7.1.3", variants: ["apache"]}' \
+	"$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+jq '.tags["7.1.3-php8.4-apache"] = .tags["6.1.3-php8.4-apache"]' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+run_engine_args --dry-run
+jq -s -e '
+	([.[] | select(.latest == "yes")] | length == 1 and .[0].version == "7.0.0") and
+	([.[] | select(.latest_mcp == "yes")] | length == 1 and .[0].version == "6.0.0" and .[0].joomla == "6.1.3")
+' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'MCP latest followed an incompatible standard latest leader'
+mv "$CASE_DIR/conf/versions.matrix" "$CASE_DIR/conf/versions.json"
+mv "$CASE_DIR/conf/upstream-images.matrix" "$CASE_DIR/conf/upstream-images.json"
+echo 'ok - latest-mcp independently tracks the newest compatible stable image'
+
+for incompatible_joomla in 6.0.5 7.1.3 5.4.3; do
+	jq --arg joomla "$incompatible_joomla" '."6".joomla = $joomla' \
+		"$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+	mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+	jq --arg joomla "$incompatible_joomla" '.tags |= (to_entries | map(.key |= sub("^[0-9]+\\.[0-9]+\\.[0-9]+"; $joomla)) | from_entries)' \
+		"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+	mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+	run_engine_args --dry-run
+	jq -s -e 'length == 9 and all(.[]; .flavor == "standard" and .mcp == null)' \
+		"$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail "MCP was added to incompatible Joomla $incompatible_joomla"
+done
+echo 'ok - incompatible Joomla targets retain every plain image and receive no MCP counterpart'
+
+sed -i 's#<sha512>[^<]*</sha512>#<sha512></sha512>#' "$JOOMENGINE_MCP_XML_FILE"
+if JOOMENGINE_EXPECT_FAILURE=yes run_engine_args --dry-run; then
+	fail 'missing MCP checksum returned success'
+fi
+[[ ! -s "$TRACE_FILE" ]] || fail 'missing MCP checksum invoked Docker'
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$matrix_hashes" ]] || fail 'invalid MCP metadata changed successful build state'
+echo 'ok - incomplete MCP metadata fails before building or advancing successful state'
