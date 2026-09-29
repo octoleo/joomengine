@@ -89,6 +89,15 @@ jobs:
           jq -e . conf/versions.json >/dev/null
           jq -e . conf/upstream-images.json >/dev/null
 
+      # Resolve all fallible upstream metadata before advancing the persisted
+      # Joomla state, so a failed MCP lookup cannot consume a Joomla rebuild.
+      - name: Check latest stable MCP package
+        id: mcp
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./src/bin/check-mcp-release.sh
+
       - name: Commit upstream image state
         if: steps.releases.outputs.changed == 'yes'
         shell: bash
@@ -105,13 +114,6 @@ jobs:
           git fetch origin "$DEFAULT_BRANCH"
           git rebase "origin/$DEFAULT_BRANCH"
           git push origin "HEAD:$DEFAULT_BRANCH"
-
-      - name: Check latest stable MCP package
-        id: mcp
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./src/bin/check-mcp-release.sh
 
       - name: Trigger normal image build workflow
         if: steps.releases.outputs.changed == 'yes' || steps.mcp.outputs.changed == 'yes'
