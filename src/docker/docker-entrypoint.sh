@@ -20,6 +20,7 @@ fi
 
 : "${JOOMLA_WEBROOT:=/var/www/html}"
 : "${JCB_ZIP_PATH:=/usr/src/joomengine/jcb.zip}"
+: "${MCP_ZIP_PATH:=/usr/src/joomengine/mcp.zip}"
 
 # Function to log messages
 joomla_log() {
@@ -185,6 +186,36 @@ joomla_install_extension_via_path() {
         joomla_log_error "Invalid Path: $path"
         return 1
     fi
+}
+
+# Complete an MCP installation scheduled by this entrypoint during fresh
+# deployment. Keep pending state on the persistent Joomla volume until the
+# package installer succeeds, so a failed installation is retried on restart.
+# Existing sites without pending state are never changed by switching images.
+joomla_complete_mcp_install() {
+    local pending_path="${JOOMLA_WEBROOT}/.joomengine-mcp-pending"
+    local installed_path="${JOOMLA_WEBROOT}/.joomengine-mcp-installed"
+
+    if [[ ! -f "$pending_path" || -f "$installed_path" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$MCP_ZIP_PATH" ]]; then
+        joomla_log_error \
+            "MCP installation is pending, but ${MCP_ZIP_PATH} is missing. Restart with the MCP image to complete deployment."
+        return 1
+    fi
+
+    joomla_log_info "Installing the bundled JoomEngine MCP package."
+    if ! joomla_install_extension_via_path "$MCP_ZIP_PATH"; then
+        joomla_log_error "MCP installation failed; deployment will retry it on the next startup."
+        return 1
+    fi
+
+    # Rename only after a successful install; never mark a failed attempt as
+    # complete. The installed marker also prevents later image upgrades from
+    # upgrading an already-deployed site's MCP package automatically.
+    mv "$pending_path" "$installed_path"
 }
 
 # Function to validate necessary environment variables
@@ -406,6 +437,8 @@ joomla_finalize_webroot_on_exit() {
 }
 
 joomla_main() {
+    local needs_post_install=0
+
     if [[ "$#" -eq 0 ]]; then
         joomla_log_error "No startup command was provided."
         return 1
@@ -548,34 +581,11 @@ if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installati
         # Install official JCB package (always-once)
         joomla_install_extension_via_path "$JCB_ZIP_PATH"
 
-        if [[ -n "${JOOMLA_SMTP_HOST:-}" && "${JOOMLA_SMTP_HOST}" == *:* ]]; then
-            joomla_get_host_port_by_colon "$JOOMLA_SMTP_HOST" JOOMLA_SMTP_HOST JOOMLA_SMTP_HOST_PORT
-        fi
-
-        # add the smtp host to configuration file
-        if [[ -n "${JOOMLA_SMTP_HOST:-}" && "${#JOOMLA_SMTP_HOST}" -gt 2 ]]; then
-            chmod u+w "${JOOMLA_WEBROOT}/configuration.php"
-            sed -i \
-                "s/public \$mailer = 'mail';/public \$mailer = 'smtp';/g" \
-                "${JOOMLA_WEBROOT}/configuration.php"
-            sed -i \
-                "s/public \$smtphost = 'localhost';/public \$smtphost = '${JOOMLA_SMTP_HOST}';/g" \
-                "${JOOMLA_WEBROOT}/configuration.php"
-        fi
-
-        # add the smtp port to configuration file
-        if [[ -n "${JOOMLA_SMTP_HOST_PORT:-}" ]]; then
-            sed -i \
-                "s/public \$smtpport = 25;/public \$smtpport = ${JOOMLA_SMTP_HOST_PORT};/g" \
-                "${JOOMLA_WEBROOT}/configuration.php"
-        fi
-
-        # run cli commands if found
-        if [[ -n "${JOOMLA_CLI_COMMANDS:-}" && "${#JOOMLA_CLI_COMMANDS}" -gt 2 ]]; then
-            joomla_get_array_by_semicolon "$JOOMLA_CLI_COMMANDS" J_C_COMMANDS
-            for joomla_command in "${J_C_COMMANDS[@]}"; do
-                joomla_run_cli_string "$joomla_command"
-            done
+        needs_post_install=1
+        # Only opt into MCP during a fresh deployment with the bundled ZIP.
+        # Schedule it after JCB succeeds, before invoking the MCP installer.
+        if [[ -f "$MCP_ZIP_PATH" && ! -f "${JOOMLA_WEBROOT}/.joomengine-mcp-installed" ]]; then
+            : > "${JOOMLA_WEBROOT}/.joomengine-mcp-pending"
         fi
 
     else
@@ -583,6 +593,47 @@ if [ -d "${JOOMLA_WEBROOT}/installation" ] && [ -e "${JOOMLA_WEBROOT}/installati
     fi
 else
     joomla_log_success_and_need_db_message
+fi
+
+# This is deliberately outside the fresh Joomla block: its installation
+# directory has already been removed when an MCP install fails. A pending
+# attempt resumes before SMTP setup, user CLI commands and ownership repair.
+if [[ -f "${JOOMLA_WEBROOT}/.joomengine-mcp-pending" && \
+      ! -f "${JOOMLA_WEBROOT}/.joomengine-mcp-installed" ]]; then
+    joomla_complete_mcp_install
+    needs_post_install=1
+fi
+
+if [[ "$needs_post_install" == '1' ]]; then
+    if [[ -n "${JOOMLA_SMTP_HOST:-}" && "${JOOMLA_SMTP_HOST}" == *:* ]]; then
+        joomla_get_host_port_by_colon "$JOOMLA_SMTP_HOST" JOOMLA_SMTP_HOST JOOMLA_SMTP_HOST_PORT
+    fi
+
+    # add the smtp host to configuration file
+    if [[ -n "${JOOMLA_SMTP_HOST:-}" && "${#JOOMLA_SMTP_HOST}" -gt 2 ]]; then
+        chmod u+w "${JOOMLA_WEBROOT}/configuration.php"
+        sed -i \
+            "s/public \$mailer = 'mail';/public \$mailer = 'smtp';/g" \
+            "${JOOMLA_WEBROOT}/configuration.php"
+        sed -i \
+            "s/public \$smtphost = 'localhost';/public \$smtphost = '${JOOMLA_SMTP_HOST}';/g" \
+            "${JOOMLA_WEBROOT}/configuration.php"
+    fi
+
+    # add the smtp port to configuration file
+    if [[ -n "${JOOMLA_SMTP_HOST_PORT:-}" ]]; then
+        sed -i \
+            "s/public \$smtpport = 25;/public \$smtpport = ${JOOMLA_SMTP_HOST_PORT};/g" \
+            "${JOOMLA_WEBROOT}/configuration.php"
+    fi
+
+    # run cli commands if found
+    if [[ -n "${JOOMLA_CLI_COMMANDS:-}" && "${#JOOMLA_CLI_COMMANDS}" -gt 2 ]]; then
+        joomla_get_array_by_semicolon "$JOOMLA_CLI_COMMANDS" J_C_COMMANDS
+        for joomla_command in "${J_C_COMMANDS[@]}"; do
+            joomla_run_cli_string "$joomla_command"
+        done
+    fi
 fi
 
 # Run after every normal startup, including already-installed sites. All

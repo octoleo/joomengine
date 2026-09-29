@@ -92,9 +92,14 @@ assert_contains() {
 run_test() {
     local name="$1"
     local test_function="$2"
+    local status
 
     tests_run=$((tests_run + 1))
-    if (set -euo pipefail; "$test_function"); then
+    # Do not put the subshell in an `if`: Bash would disable errexit inside
+    # every test function and silently ignore an earlier failed assertion.
+    (set -euo pipefail; "$test_function")
+    status=$?
+    if [[ "$status" -eq 0 ]]; then
         printf 'ok %d - %s\n' "$tests_run" "$name"
     else
         failures=$((failures + 1))
@@ -321,6 +326,7 @@ test_install_and_restart_finalizer_order() {
             source "$1"
             export JOOMLA_WEBROOT="$JOOMENGINE_TEST_WEBROOT"
             export JCB_ZIP_PATH="$JOOMENGINE_TEST_JCB_ZIP"
+            export MCP_ZIP_PATH="${JOOMENGINE_TEST_JCB_ZIP}.absent"
             joomla_main apache2-foreground
         ' joomengine-entrypoint-test "$ENTRYPOINT"
 
@@ -356,6 +362,7 @@ test_install_and_restart_finalizer_order() {
             source "$1"
             export JOOMLA_WEBROOT="$JOOMENGINE_TEST_WEBROOT"
             export JCB_ZIP_PATH="$JOOMENGINE_TEST_JCB_ZIP"
+            export MCP_ZIP_PATH="${JOOMENGINE_TEST_JCB_ZIP}.absent"
             joomla_main apache2-foreground
         ' joomengine-entrypoint-test "$ENTRYPOINT"
 
@@ -384,6 +391,7 @@ test_install_and_restart_finalizer_order() {
                 source "$1"
                 export JOOMLA_WEBROOT="$JOOMENGINE_TEST_WEBROOT"
                 export JCB_ZIP_PATH="$JOOMENGINE_TEST_JCB_ZIP"
+                export MCP_ZIP_PATH="${JOOMENGINE_TEST_JCB_ZIP}.absent"
                 joomla_main apache2-foreground
             ' joomengine-entrypoint-test "$ENTRYPOINT"; then
         fail 'failed Joomla CLI command did not abort startup'
@@ -397,6 +405,158 @@ test_install_and_restart_finalizer_order() {
     [[ "$server_line" -eq 0 ]] || fail 'Apache started after Joomla CLI failure'
 }
 
+# Run the real entrypoint in a fresh shell; command mocks record ordering and
+# failure behavior while marker files persist between runs like a Docker volume.
+run_mcp_entrypoint() {
+    local fixture_dir="$1"
+    local failure_match="${2:-}"
+
+    JOOMENGINE_ENTRYPOINT_MOCK=1 \
+    JOOMENGINE_TRACE_FILE="${fixture_dir}/trace" \
+    JOOMENGINE_FAIL_PHP_MATCH="$failure_match" \
+    JOOMLA_WEBROOT="${fixture_dir}/html" \
+    JCB_ZIP_PATH="${fixture_dir}/jcb.zip" \
+    MCP_ZIP_PATH="${fixture_dir}/mcp.zip" \
+    PATH="${fixture_dir}/bin:$PATH" \
+    JOOMLA_DB_HOST='database:3306' \
+    JOOMLA_DB_PASSWORD='database-password' \
+    APACHE_RUN_USER='1201' \
+    APACHE_RUN_GROUP='1302' \
+    JOOMLA_CLI_COMMANDS='cache:clean --no-interaction' \
+        bash "$ENTRYPOINT" apache2-foreground
+}
+
+create_mcp_fixture() {
+    local fixture_dir="$1"
+
+    mkdir -p "${fixture_dir}/html"
+    : > "${fixture_dir}/jcb.zip"
+    : > "${fixture_dir}/trace"
+    create_mock_path "${fixture_dir}/bin"
+}
+
+test_mcp_absent_and_existing_volume() {
+    local temp_dir
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' RETURN
+    create_mcp_fixture "$temp_dir"
+
+    run_mcp_entrypoint "$temp_dir"
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'absent MCP was scheduled'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'absent MCP was marked installed'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" '--path '"${temp_dir}/mcp.zip")" \
+        'standard image must not install MCP'
+    assert_contains "$(<"${temp_dir}/trace")" "--path ${temp_dir}/jcb.zip" \
+        'standard image still installs JCB'
+
+    # Switching an already-deployed site to an MCP image must not silently
+    # modify its extensions: automatic installation is first-deployment only.
+    : > "${temp_dir}/mcp.zip"
+    : > "${temp_dir}/trace"
+    run_mcp_entrypoint "$temp_dir"
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'extension:install')" \
+        'existing volume must not acquire MCP automatically'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'existing site scheduled MCP'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'existing site marked MCP installed'
+}
+
+test_mcp_installs_once_in_order() {
+    local temp_dir
+    local jcb_line mcp_line cli_line finalizer_line server_line
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' RETURN
+    create_mcp_fixture "$temp_dir"
+    : > "${temp_dir}/mcp.zip"
+
+    run_mcp_entrypoint "$temp_dir"
+    jcb_line="$(trace_line_number "${temp_dir}/trace" "--path ${temp_dir}/jcb.zip")"
+    mcp_line="$(trace_line_number "${temp_dir}/trace" "--path ${temp_dir}/mcp.zip")"
+    cli_line="$(trace_line_number "${temp_dir}/trace" 'cache:clean')"
+    finalizer_line="$(trace_line_number "${temp_dir}/trace" "chown:-R 1201:1302 ${temp_dir}/html")"
+    server_line="$(trace_line_number "${temp_dir}/trace" 'apache2-foreground:')"
+    [[ "$jcb_line" -gt 0 && "$mcp_line" -gt "$jcb_line" ]] || fail 'MCP must install after JCB'
+    [[ "$cli_line" -gt "$mcp_line" ]] || fail 'custom CLI must run after MCP'
+    [[ "$finalizer_line" -gt "$cli_line" && "$server_line" -gt "$finalizer_line" ]] || \
+        fail 'server must start after MCP, CLI and final ownership repair'
+    [[ -f "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'successful MCP has no completion marker'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'successful MCP still pending'
+
+    # A newer image can contain a different package; it must not reinstall or
+    # automatically upgrade MCP in an existing persistent site.
+    printf 'new package contents\n' > "${temp_dir}/mcp.zip"
+    : > "${temp_dir}/trace"
+    run_mcp_entrypoint "$temp_dir"
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'extension:install')" \
+        'completed MCP must not reinstall after restart or image upgrade'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'cache:clean')" \
+        'completed deployment must not rerun custom CLI commands'
+}
+
+test_mcp_failed_install_retries() {
+    local temp_dir
+    local mcp_line cli_line finalizer_line server_line
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' RETURN
+    create_mcp_fixture "$temp_dir"
+    : > "${temp_dir}/mcp.zip"
+
+    if run_mcp_entrypoint "$temp_dir" "${temp_dir}/mcp.zip"; then
+        fail 'MCP failure did not abort startup'
+    fi
+    [[ -f "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'failed MCP has no retry marker'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'failed MCP marked installed'
+    [[ ! -d "${temp_dir}/html/installation" ]] || fail 'test did not exercise post-Joomla retry'
+    mcp_line="$(trace_line_number "${temp_dir}/trace" "--path ${temp_dir}/mcp.zip")"
+    finalizer_line="$(trace_line_number "${temp_dir}/trace" "chown:-R 1201:1302 ${temp_dir}/html")"
+    [[ "$mcp_line" -gt 0 && "$finalizer_line" -gt "$mcp_line" ]] || \
+        fail 'MCP failure did not trigger final ownership repair'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'cache:clean')" \
+        'custom CLI must wait for MCP success'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'apache2-foreground:')" \
+        'server must not start after MCP failure'
+
+    : > "${temp_dir}/trace"
+    run_mcp_entrypoint "$temp_dir"
+    mcp_line="$(trace_line_number "${temp_dir}/trace" "--path ${temp_dir}/mcp.zip")"
+    cli_line="$(trace_line_number "${temp_dir}/trace" 'cache:clean')"
+    finalizer_line="$(trace_line_number "${temp_dir}/trace" "chown:-R 1201:1302 ${temp_dir}/html")"
+    server_line="$(trace_line_number "${temp_dir}/trace" 'apache2-foreground:')"
+    [[ "$mcp_line" -gt 0 && "$cli_line" -gt "$mcp_line" ]] || \
+        fail 'retry did not install MCP before completing custom CLI'
+    [[ "$finalizer_line" -gt "$cli_line" && "$server_line" -gt "$finalizer_line" ]] || \
+        fail 'retry did not finalize ownership before starting server'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" "--path ${temp_dir}/jcb.zip")" \
+        'MCP retry must not reinstall JCB'
+    [[ -f "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'retry has no completion marker'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'retry left pending marker'
+
+    : > "${temp_dir}/trace"
+    run_mcp_entrypoint "$temp_dir"
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'extension:install')" \
+        'successful retry must not install again'
+}
+
+test_mcp_pending_requires_package() {
+    local temp_dir
+    temp_dir="$(mktemp -d)"
+    trap 'rm -rf "$temp_dir"' RETURN
+    create_mcp_fixture "$temp_dir"
+    : > "${temp_dir}/mcp.zip"
+    if run_mcp_entrypoint "$temp_dir" "${temp_dir}/mcp.zip"; then
+        fail 'fixture MCP failure did not abort startup'
+    fi
+
+    rm "${temp_dir}/mcp.zip"
+    : > "${temp_dir}/trace"
+    if run_mcp_entrypoint "$temp_dir"; then
+        fail 'pending MCP was silently skipped when the package disappeared'
+    fi
+    [[ -f "${temp_dir}/html/.joomengine-mcp-pending" ]] || fail 'missing ZIP erased pending state'
+    [[ ! -e "${temp_dir}/html/.joomengine-mcp-installed" ]] || fail 'missing ZIP marked installed'
+    assert_equal '0' "$(trace_line_number "${temp_dir}/trace" 'apache2-foreground:')" \
+        'incomplete deployment must not start the server'
+}
+
 run_test 'numeric Apache UID/GID resolution' test_numeric_apache_identity
 run_test 'named Apache UID/GID resolution' test_named_apache_identity
 run_test 'FPM www-data identity resolution' test_fpm_identity_uses_www_data
@@ -404,6 +564,10 @@ run_test 'Joomla CLI failure propagation' test_cli_failure_propagates
 run_test 'invalid extension input propagation' test_invalid_extension_inputs_fail
 run_test 'recursive fatal ownership repair' test_ownership_repair_is_recursive_and_fatal
 run_test 'install/restart finalizer ordering' test_install_and_restart_finalizer_order
+run_test 'MCP absent and existing volumes remain unchanged' test_mcp_absent_and_existing_volume
+run_test 'MCP installs after JCB only once' test_mcp_installs_once_in_order
+run_test 'failed MCP installs retry before custom CLI and server startup' test_mcp_failed_install_retries
+run_test 'pending MCP deployment requires its bundled package' test_mcp_pending_requires_package
 
 printf '1..%d\n' "$tests_run"
 if [[ "$failures" -ne 0 ]]; then
