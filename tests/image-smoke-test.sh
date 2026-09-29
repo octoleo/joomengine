@@ -76,8 +76,14 @@ assert_query() {
 
 wait_for_http() {
     local phase="$1"
+    local http_port
     local deadline=$((SECONDS + timeout_seconds))
     local next_progress=$((SECONDS + 30))
+    # Docker may assign another ephemeral host port when a container restarts.
+    # Read the current mapping for each phase rather than retaining the first.
+    http_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$application")"
+    [[ "$http_port" =~ ^[0-9]+$ ]] || fail "Apache port was not published during $phase"
+    echo "Checking $flavor $phase on HTTP port $http_port..."
     while (( SECONDS < deadline )); do
         container_running "$application" || fail "Application exited during $phase"
         if curl --fail --silent --output /dev/null --max-time 5 \
@@ -140,6 +146,7 @@ until docker exec "$database" healthcheck.sh --connect --innodb_initialized >/de
     sleep 2
 done
 
+echo "Starting $flavor first deployment..."
 docker run --detach --name "$application" --network "$network" \
     --platform linux/amd64 --publish 127.0.0.1::80 \
     --env JOOMLA_DB_HOST=database --env JOOMLA_DB_USER=joomengine \
@@ -151,8 +158,6 @@ docker run --detach --name "$application" --network "$network" \
     --env JOOMLA_ADMIN_PASSWORD='Disposable-Smoke-Password-2026!' \
     --env JOOMLA_ADMIN_EMAIL=smoke@example.com \
     "$image" >/dev/null
-http_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' "$application")"
-[[ "$http_port" =~ ^[0-9]+$ ]] || fail 'Apache port was not published'
 
 wait_for_http 'first deployment'
 verify_extensions
@@ -167,6 +172,7 @@ docker exec "$application" sh -eu -c '
         printf "This archive must never be installed again.\n" > /usr/src/joomengine/mcp.zip
     fi
 '
+echo "Starting $flavor restart after successful first deployment..."
 docker restart --time 20 "$application" >/dev/null
 wait_for_http restart
 verify_extensions
