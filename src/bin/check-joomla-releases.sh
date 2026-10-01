@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Poll Joomla's authoritative stable-release feed and advance the Joomla base
-# versions only after every configured official Docker image is available.
+# Poll Joomla's stable-release feed and verify the published Docker registry
+# indexes before advancing base versions or refreshing their digest state.
 
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
@@ -19,10 +19,11 @@ RELEASES_FILE=""
 DOCKER_TAGS_FILE=""
 OFFICIAL_IMAGES_FILE=""
 QUIET="no"
+REFRESH_CURRENT="no"
 
 JOOMLA_RELEASES_URL="${JOOMLA_RELEASES_URL:-https://downloads.joomla.org/api/v1/latest/cms}"
-DOCKER_HUB_TAG_API_BASE="${DOCKER_HUB_TAG_API_BASE:-https://hub.docker.com/v2/namespaces/library/repositories/joomla/tags}"
-OFFICIAL_IMAGES_URL="${OFFICIAL_IMAGES_URL:-https://raw.githubusercontent.com/docker-library/official-images/master/library/joomla}"
+DOCKER_REGISTRY_API_BASE="${DOCKER_REGISTRY_API_BASE:-https://registry-1.docker.io/v2/library/joomla}"
+DOCKER_REGISTRY_TOKEN_URL="${DOCKER_REGISTRY_TOKEN_URL:-https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/joomla:pull}"
 
 show_help() {
 	cat <<'EOF'
@@ -31,18 +32,20 @@ Usage: check-joomla-releases.sh [options]
 Options:
       --versions-file PATH     Joomla build matrix to inspect and update
       --state-file PATH        Persist verified image-index and platform digests
+      --refresh-current        Verify configured versions without checking releases
       --releases-file PATH     Read Joomla release data from a local JSON file
       --docker-tags-file PATH  Read Docker tag data from a local JSON file
       --official-images-file PATH
-                              Read official-images metadata from a local file
+                              Deprecated compatibility option; metadata is unused
   -q, --quiet                  Suppress informational output
   -h, --help                   Show this help and exit
 
 The local data options provide deterministic, network-free execution for tests.
 The Docker fixture format is the Docker Hub list response shape: a top-level
 "results" array containing tag objects with "name" and "images" fields.
-The official-images fixture uses the docker-library/official-images library-file
-format, including unique "Tags" and "Architectures" fields per image stanza.
+Live verification reads and hashes the published Docker registry index. Its
+runnable Linux descriptors determine the available platforms; official-images
+architecture declarations can include platforms that are not yet published.
 
 Exit behavior:
   0  Successful update, no update, or a release whose Docker matrix is pending
@@ -67,6 +70,10 @@ while [[ $# -gt 0 ]]; do
 			}
 			STATE_FILE="$2"
 			shift 2
+			;;
+		--refresh-current)
+			REFRESH_CURRENT="yes"
+			shift
 			;;
 		--releases-file)
 			[[ $# -ge 2 ]] || {
@@ -117,11 +124,11 @@ fail() {
 	exit 1
 }
 
-for command_name in awk jq sort realpath mktemp cmp chmod mv; do
+for command_name in awk jq sort realpath mktemp cmp chmod mv sha256sum; do
 	command -v "$command_name" >/dev/null 2>&1 || fail "Missing required command: $command_name"
 done
 
-if [[ -z "$RELEASES_FILE" || -z "$DOCKER_TAGS_FILE" || -z "$OFFICIAL_IMAGES_FILE" ]]; then
+if [[ ( "$REFRESH_CURRENT" == "no" && -z "$RELEASES_FILE" ) || -z "$DOCKER_TAGS_FILE" ]]; then
 	command -v curl >/dev/null 2>&1 || fail "Missing required command: curl"
 fi
 
@@ -226,21 +233,28 @@ if [[ -f "$STATE_FILE" ]] && ! jq -e '
 fi
 
 RELEASES_TMP=""
-OFFICIAL_IMAGES_TMP=""
+REGISTRY_TOKEN_TMP=""
+REGISTRY_MANIFEST_TMP=""
+REGISTRY_HEADERS_TMP=""
+REGISTRY_TOKEN=""
 TAG_TMP=""
 OUTPUT_TMP=""
 STATE_TMP=""
 
 cleanup() {
 	[[ -z "$RELEASES_TMP" ]] || rm -f -- "$RELEASES_TMP"
-	[[ -z "$OFFICIAL_IMAGES_TMP" ]] || rm -f -- "$OFFICIAL_IMAGES_TMP"
+	[[ -z "$REGISTRY_TOKEN_TMP" ]] || rm -f -- "$REGISTRY_TOKEN_TMP"
+	[[ -z "$REGISTRY_MANIFEST_TMP" ]] || rm -f -- "$REGISTRY_MANIFEST_TMP"
+	[[ -z "$REGISTRY_HEADERS_TMP" ]] || rm -f -- "$REGISTRY_HEADERS_TMP"
 	[[ -z "$TAG_TMP" ]] || rm -f -- "$TAG_TMP"
 	[[ -z "$OUTPUT_TMP" ]] || rm -f -- "$OUTPUT_TMP"
 	[[ -z "$STATE_TMP" ]] || rm -f -- "$STATE_TMP"
 }
 trap cleanup EXIT
 
-if [[ -n "$RELEASES_FILE" ]]; then
+if [[ "$REFRESH_CURRENT" == "yes" ]]; then
+	RELEASES_SOURCE=""
+elif [[ -n "$RELEASES_FILE" ]]; then
 	RELEASES_SOURCE="$RELEASES_FILE"
 else
 	RELEASES_TMP="$(mktemp)"
@@ -264,7 +278,7 @@ else
 	RELEASES_SOURCE="$RELEASES_TMP"
 fi
 
-if ! jq -e '
+if [[ "$REFRESH_CURRENT" == "no" ]] && ! jq -e '
 	type == "object" and
 	(.branches | type == "array" and length > 0) and
 	all(
@@ -276,32 +290,6 @@ if ! jq -e '
 ' "$RELEASES_SOURCE" >/dev/null; then
 	fail "Joomla stable release response does not match the expected schema"
 fi
-
-if [[ -n "$OFFICIAL_IMAGES_FILE" ]]; then
-	OFFICIAL_IMAGES_SOURCE="$OFFICIAL_IMAGES_FILE"
-else
-	OFFICIAL_IMAGES_TMP="$(mktemp)"
-	log "Checking official Joomla image metadata: $OFFICIAL_IMAGES_URL"
-
-	if ! curl \
-		--fail-with-body \
-		--silent \
-		--show-error \
-		--location \
-		--retry 3 \
-		--retry-delay 2 \
-		--retry-connrefused \
-		--connect-timeout 15 \
-		--max-time 60 \
-		--output "$OFFICIAL_IMAGES_TMP" \
-		"$OFFICIAL_IMAGES_URL"; then
-		fail "Unable to retrieve official Joomla image metadata"
-	fi
-
-	OFFICIAL_IMAGES_SOURCE="$OFFICIAL_IMAGES_TMP"
-fi
-
-[[ -s "$OFFICIAL_IMAGES_SOURCE" ]] || fail "Official Joomla image metadata is empty"
 
 if [[ -n "$DOCKER_TAGS_FILE" ]] && ! jq -e '
 	type == "object" and
@@ -327,105 +315,10 @@ fi
 
 TAG_TMP="$(mktemp)"
 
-normalize_official_architecture() {
-	local architecture="${1,,}"
-
-	case "$architecture" in
-		amd64)
-			printf '%s\n' "linux/amd64"
-			;;
-		i386)
-			printf '%s\n' "linux/386"
-			;;
-		arm32v[0-9]*)
-			[[ "$architecture" =~ ^arm32v([0-9]+)$ ]] || return 1
-			printf 'linux/arm/v%s\n' "${BASH_REMATCH[1]}"
-			;;
-		arm64v[0-9]*)
-			[[ "$architecture" =~ ^arm64v([0-9]+)$ ]] || return 1
-			printf 'linux/arm64/v%s\n' "${BASH_REMATCH[1]}"
-			;;
-		unknown|*[!a-z0-9._-]*|'')
-			return 1
-			;;
-		*)
-			printf 'linux/%s\n' "$architecture"
-			;;
-	esac
-}
-
-official_tag_platforms() {
-	local tag="$1"
-	local architectures
-	local architecture
-	local platform
-	local status
-	local index
-	local -a declared_architectures=()
-	local -a platforms=()
-	local -a sorted_platforms=()
-
-	architectures="$({
-		awk -v wanted="$tag" '
-			BEGIN { RS = ""; FS = "\n"; matches = 0 }
-			{
-				tags = ""
-				architectures = ""
-				for (line_number = 1; line_number <= NF; line_number++) {
-					if ($line_number ~ /^Tags:[[:space:]]*/) {
-						tags = $line_number
-						sub(/^Tags:[[:space:]]*/, "", tags)
-					} else if ($line_number ~ /^Architectures:[[:space:]]*/) {
-						architectures = $line_number
-						sub(/^Architectures:[[:space:]]*/, "", architectures)
-					}
-				}
-
-				tag_count = split(tags, tag_values, /[[:space:]]*,[[:space:]]*/)
-				for (tag_index = 1; tag_index <= tag_count; tag_index++) {
-					if (tag_values[tag_index] == wanted) {
-						matches++
-						match_architectures = architectures
-					}
-				}
-			}
-			END {
-				if (matches == 0) exit 1
-				if (matches != 1 || match_architectures == "") exit 2
-				print match_architectures
-			}
-		' "$OFFICIAL_IMAGES_SOURCE"
-	} 2>/dev/null)" || {
-		status=$?
-		return "$status"
-	}
-
-	IFS=',' read -r -a declared_architectures <<< "$architectures"
-	for architecture in "${declared_architectures[@]}"; do
-		architecture="${architecture#"${architecture%%[![:space:]]*}"}"
-		architecture="${architecture%"${architecture##*[![:space:]]}"}"
-		if ! platform="$(normalize_official_architecture "$architecture")"; then
-			echo "[ERROR] Unknown official architecture '$architecture' for joomla:$tag" >&2
-			return 2
-		fi
-		platforms+=("$platform")
-	done
-
-	[[ "${#platforms[@]}" -gt 0 ]] || return 2
-	mapfile -t sorted_platforms < <(printf '%s\n' "${platforms[@]}" | sort)
-	for ((index = 1; index < ${#sorted_platforms[@]}; index++)); do
-		if [[ "${sorted_platforms[$((index - 1))]}" == "${sorted_platforms[$index]}" ]]; then
-			echo "[ERROR] Duplicate canonical platform '${sorted_platforms[$index]}' for joomla:$tag" >&2
-			return 2
-		fi
-	done
-
-	printf '%s\n' "${sorted_platforms[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
-}
-
 normalize_docker_tag_record() {
 	local source="$1"
 	local expected_tag="$2"
+	local source_kind="${3:-fixture}"
 	local index_digest
 
 	if ! jq -e --arg tag "$expected_tag" '
@@ -442,7 +335,7 @@ normalize_docker_tag_record() {
 			(.variant == null or (.variant | type == "string"))
 		)
 	' "$source" >/dev/null; then
-		echo "[ERROR] Docker Hub returned an invalid response for '$expected_tag'" >&2
+		echo "[ERROR] Invalid Docker image record for '$expected_tag'" >&2
 		return 2
 	fi
 
@@ -458,7 +351,7 @@ normalize_docker_tag_record() {
 	fi
 
 	index_digest="$(jq -r '.digest' "$source")"
-	if ! jq -ce --arg index_digest "$index_digest" '
+	if ! jq -ce --arg index_digest "$index_digest" --arg source_kind "$source_kind" '
 		def normalized_architecture:
 			ascii_downcase |
 			if . == "x86_64" or . == "x86-64" then "amd64"
@@ -476,11 +369,13 @@ normalize_docker_tag_record() {
 		def platform_entry:
 			(.architecture | normalized_architecture) as $raw_architecture |
 			(.variant // "" | normalized_variant) as $raw_variant |
-			(if $raw_architecture == "arm" and $raw_variant == "" then
+			(if $raw_architecture == "amd64" and $raw_variant == "v1" then
+				{architecture: "amd64", variant: ""}
+			elif $raw_architecture == "arm" and $raw_variant == "" then
 				{architecture: "arm", variant: "v7"}
 			elif $raw_architecture == "arm64" and $raw_variant == "" then
 				{architecture: "arm64", variant: "v8"}
-			elif $raw_architecture == "arm" and $raw_variant == "v8" then
+			elif $source_kind == "fixture" and $raw_architecture == "arm" and $raw_variant == "v8" then
 				{architecture: "arm64", variant: "v8"}
 			else
 				{architecture: $raw_architecture, variant: $raw_variant}
@@ -519,7 +414,7 @@ normalize_docker_tag_record() {
 			}
 		end
 	' "$source" 2>/dev/null; then
-		echo "[ERROR] Docker Hub returned conflicting or invalid platforms for '$expected_tag'" >&2
+		echo "[ERROR] Conflicting or invalid Docker platforms for '$expected_tag'" >&2
 		return 2
 	fi
 }
@@ -541,13 +436,44 @@ docker_fixture_tag_record() {
 	normalize_docker_tag_record "$TAG_TMP" "$tag"
 }
 
-docker_api_tag_record() {
+initialize_registry() {
+	REGISTRY_TOKEN_TMP="$(mktemp)"
+	REGISTRY_MANIFEST_TMP="$(mktemp)"
+	REGISTRY_HEADERS_TMP="$(mktemp)"
+
+	if ! curl \
+		--fail-with-body \
+		--silent \
+		--show-error \
+		--location \
+		--retry 3 \
+		--retry-delay 2 \
+		--retry-connrefused \
+		--connect-timeout 15 \
+		--max-time 60 \
+		--output "$REGISTRY_TOKEN_TMP" \
+		"$DOCKER_REGISTRY_TOKEN_URL"; then
+		fail "Unable to obtain an anonymous Docker registry pull token"
+	fi
+
+	if ! REGISTRY_TOKEN="$(jq -er '
+		(.token // .access_token) |
+		select(type == "string" and length > 0 and (test("[[:space:][:cntrl:]]") | not))
+	' "$REGISTRY_TOKEN_TMP")"; then
+		fail "Docker registry returned an invalid pull token"
+	fi
+}
+
+docker_registry_tag_record() {
 	local tag="$1"
 	local curl_status=0
 	local http_status=""
-	local url="${DOCKER_HUB_TAG_API_BASE%/}/${tag}"
+	local index_digest
+	local body_digest
+	local url="${DOCKER_REGISTRY_API_BASE%/}/manifests/${tag}"
 
-	: > "$TAG_TMP"
+	: > "$REGISTRY_MANIFEST_TMP"
+	: > "$REGISTRY_HEADERS_TMP"
 
 	if http_status="$(
 		curl \
@@ -560,7 +486,10 @@ docker_api_tag_record() {
 			--retry-connrefused \
 			--connect-timeout 15 \
 			--max-time 60 \
-			--output "$TAG_TMP" \
+			--header "Authorization: Bearer $REGISTRY_TOKEN" \
+			--header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+			--output "$REGISTRY_MANIFEST_TMP" \
+			--dump-header "$REGISTRY_HEADERS_TMP" \
 			--write-out '%{http_code}' \
 			"$url" \
 			2>/dev/null
@@ -575,11 +504,78 @@ docker_api_tag_record() {
 	fi
 
 	if [[ "$curl_status" -ne 0 || "$http_status" != "200" ]]; then
-		echo "[ERROR] Docker Hub request failed for '$tag' (HTTP ${http_status:-unknown}, curl $curl_status)" >&2
+		echo "[ERROR] Docker registry request failed for '$tag' (HTTP ${http_status:-unknown}, curl $curl_status)" >&2
 		return 2
 	fi
 
-	normalize_docker_tag_record "$TAG_TMP" "$tag"
+	# Hash the original response bytes, before parsing or reformatting JSON.
+	# A Docker Hub tag page and its cached per-platform status are not evidence
+	# of the exact image index that a pull will resolve to.
+	index_digest="$(awk '
+		tolower($0) ~ /^docker-content-digest:[[:space:]]*/ {
+			sub(/^[^:]*:[[:space:]]*/, "")
+			sub(/[[:space:]]*$/, "")
+			digest = $0
+		}
+		END { print digest }
+	' "$REGISTRY_HEADERS_TMP")"
+	if [[ ! "$index_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+		echo "[ERROR] Docker registry returned no valid index digest for '$tag'" >&2
+		return 2
+	fi
+	body_digest="sha256:$(sha256sum "$REGISTRY_MANIFEST_TMP" | awk '{ print $1 }')"
+	if [[ "$body_digest" != "$index_digest" ]]; then
+		echo "[ERROR] Docker registry index digest verification failed for '$tag'" >&2
+		return 2
+	fi
+
+	if ! jq -e '
+		def digest:
+			type == "string" and test("^sha256:[a-f0-9]{64}$");
+		type == "object" and
+		.schemaVersion == 2 and
+		(.mediaType == "application/vnd.oci.image.index.v1+json" or
+			.mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") and
+		(.manifests | type == "array" and length > 0) and
+		all(
+			.manifests[];
+			type == "object" and
+			(.mediaType == "application/vnd.oci.image.manifest.v1+json" or
+				.mediaType == "application/vnd.docker.distribution.manifest.v2+json") and
+			(.digest | digest) and
+			(.size | type == "number" and . > 0 and floor == .) and
+			(.platform | type == "object") and
+			(.platform.os | type == "string" and test("^[a-zA-Z0-9][a-zA-Z0-9._-]*$")) and
+			(.platform.architecture | type == "string" and test("^[a-zA-Z0-9][a-zA-Z0-9._-]*$")) and
+			(.platform.variant == null or (.platform.variant | type == "string")) and
+			((.platform.os | ascii_downcase) != "linux" or
+				(.platform.architecture | ascii_downcase) != "unknown")
+		)
+	' "$REGISTRY_MANIFEST_TMP" >/dev/null; then
+		echo "[ERROR] Docker registry returned an invalid image index for '$tag'" >&2
+		return 2
+	fi
+
+	if ! jq --arg tag "$tag" --arg digest "$index_digest" '{
+		name: $tag,
+		digest: $digest,
+		images: [.manifests[] | {
+			digest,
+			status: "active",
+			os: .platform.os,
+			architecture: .platform.architecture,
+			variant: .platform.variant
+		}]
+	}' "$REGISTRY_MANIFEST_TMP" > "$TAG_TMP"; then
+		return 2
+	fi
+
+	local record
+	if ! record="$(normalize_docker_tag_record "$TAG_TMP" "$tag" registry)"; then
+		echo "[ERROR] Docker registry index has no valid runnable Linux platform set for '$tag'" >&2
+		return 2
+	fi
+	printf '%s\n' "$record"
 }
 
 docker_tag_record() {
@@ -588,7 +584,7 @@ docker_tag_record() {
 	if [[ -n "$DOCKER_TAGS_FILE" ]]; then
 		docker_fixture_tag_record "$tag"
 	else
-		docker_api_tag_record "$tag"
+		docker_registry_tag_record "$tag"
 	fi
 }
 
@@ -620,7 +616,6 @@ mapfile -t MAJORS < <(jq -r 'keys[]' "$VERSIONS_FILE" | sort -V)
 
 declare -A NEW_VERSION_BY_MAJOR=()
 declare -A DESIRED_RECORD_BY_TAG=()
-declare -A PERSISTED_RECORD_BY_TAG=()
 declare -A WAITING_MAJOR_SEEN=()
 declare -a UPDATED_MAJORS=()
 declare -a WAITING_MAJORS=()
@@ -628,19 +623,6 @@ declare -a COLLECTED_TAGS=()
 declare -a COLLECTED_RECORDS=()
 
 COLLECTION_READY="yes"
-STATE_SCHEMA="0"
-
-if [[ -f "$STATE_FILE" ]]; then
-	STATE_SCHEMA="$(jq -r '.schema' "$STATE_FILE")"
-	if [[ "$STATE_SCHEMA" == "2" ]]; then
-		while IFS=$'\t' read -r persisted_tag persisted_record; do
-			PERSISTED_RECORD_BY_TAG["$persisted_tag"]="$persisted_record"
-		done < <(
-			jq -r '.tags | to_entries[] | [.key, (.value | tojson)] | @tsv' "$STATE_FILE"
-		)
-	fi
-fi
-
 mark_major_waiting() {
 	local major="$1"
 
@@ -648,16 +630,6 @@ mark_major_waiting() {
 		WAITING_MAJOR_SEEN["$major"]=1
 		WAITING_MAJORS+=("$major")
 	fi
-}
-
-platform_set_difference() {
-	local minuend="$1"
-	local subtrahend="$2"
-
-	jq -cnr \
-		--argjson minuend "$minuend" \
-		--argjson subtrahend "$subtrahend" \
-		'$minuend - $subtrahend | join(",")'
 }
 
 collect_matrix_records() {
@@ -668,11 +640,6 @@ collect_matrix_records() {
 	local variant
 	local tag
 	local record
-	local required_platforms
-	local actual_platforms
-	local missing_platforms
-	local unexpected_platforms
-	local metadata_status
 	local tag_status
 	local -a php_versions=()
 	local -a variants=()
@@ -687,34 +654,6 @@ collect_matrix_records() {
 	for php_version in "${php_versions[@]}"; do
 		for variant in "${variants[@]}"; do
 			tag="${version}-php${php_version}-${variant}"
-
-			if required_platforms="$(official_tag_platforms "$tag")"; then
-				:
-			else
-				metadata_status=$?
-				if [[ "$metadata_status" -ne 1 ]]; then
-					return 2
-				fi
-
-				if [[ "$role" == "candidate" ]]; then
-					COLLECTION_READY="no"
-					log "Joomla $major: waiting for official-images metadata for joomla:$tag"
-					return 0
-				fi
-
-				if [[ -n "${PERSISTED_RECORD_BY_TAG[$tag]:-}" ]]; then
-					required_platforms="$(
-						jq -c '.platforms | keys' <<< "${PERSISTED_RECORD_BY_TAG[$tag]}"
-					)"
-					log "Joomla $major: using persisted platform policy for legacy tag joomla:$tag"
-				elif [[ "$STATE_SCHEMA" == "1" ]]; then
-					required_platforms=""
-					log "Joomla $major: discovering platforms while migrating legacy tag joomla:$tag"
-				else
-					echo "[ERROR] No authoritative or persisted platform policy for current tag: joomla:$tag" >&2
-					return 2
-				fi
-			fi
 
 			if record="$(docker_tag_record "$tag")"; then
 				:
@@ -734,24 +673,6 @@ collect_matrix_records() {
 				return 0
 			fi
 
-			actual_platforms="$(jq -c '.platforms | keys' <<< "$record")"
-			if [[ -z "$required_platforms" ]]; then
-				required_platforms="$actual_platforms"
-			fi
-
-			missing_platforms="$(platform_set_difference "$required_platforms" "$actual_platforms")"
-			unexpected_platforms="$(platform_set_difference "$actual_platforms" "$required_platforms")"
-			if [[ -n "$missing_platforms" || -n "$unexpected_platforms" ]]; then
-				if [[ "$role" == "candidate" ]]; then
-					COLLECTION_READY="no"
-					log "Joomla $major: waiting for complete platform set on joomla:$tag (missing: ${missing_platforms:-none}; unexpected: ${unexpected_platforms:-none})"
-					return 0
-				fi
-
-				echo "[ERROR] Current Docker tag platform set does not match policy: joomla:$tag (missing: ${missing_platforms:-none}; unexpected: ${unexpected_platforms:-none})" >&2
-				return 2
-			fi
-
 			COLLECTED_TAGS+=("$tag")
 			COLLECTED_RECORDS+=("$record")
 			log "Joomla $major: Docker tag ready on $(jq -r '.platforms | length' <<< "$record") platforms: joomla:$tag"
@@ -767,38 +688,47 @@ add_collected_records() {
 	done
 }
 
+if [[ -z "$DOCKER_TAGS_FILE" ]]; then
+	initialize_registry
+fi
+
 for major in "${MAJORS[@]}"; do
 	current_version="$(jq -r --arg major "$major" '.[$major].joomla' "$VERSIONS_FILE")"
 	candidate_version=""
-	release_count="$(
-		jq -r --arg branch "Joomla! $major" \
-			'[.branches[] | select(.branch == $branch)] | length' \
-			"$RELEASES_SOURCE"
-	)"
-
-	if [[ "$release_count" == "0" ]]; then
-		log "Joomla $major: no stable release entry; keeping $current_version"
-	elif [[ "$release_count" != "1" ]]; then
-		fail "Joomla stable release response contains duplicate entries for major $major"
+	if [[ "$REFRESH_CURRENT" == "yes" ]]; then
+		log "Joomla $major: refreshing configured version $current_version"
 	else
-		candidate_version="$(
+		release_count="$(
 			jq -r --arg branch "Joomla! $major" \
-				'.branches[] | select(.branch == $branch) | .version' \
+				'[.branches[] | select(.branch == $branch)] | length' \
 				"$RELEASES_SOURCE"
 		)"
 
-		if [[ "$candidate_version" =~ ^${major}\.[0-9]+\.[0-9]+[-+] ]]; then
-			log "Joomla $major: upstream entry $candidate_version is not stable; ignoring it"
-			candidate_version=""
-		elif [[ ! "$candidate_version" =~ ^${major}\.[0-9]+\.[0-9]+$ ]]; then
-			fail "Invalid stable Joomla $major version from upstream: $candidate_version"
-		elif [[ "$candidate_version" == "$current_version" ]]; then
-			log "Joomla $major: $current_version is current"
-			candidate_version=""
-		elif ! version_is_newer "$candidate_version" "$current_version"; then
-			log "Joomla $major: upstream reports older $candidate_version; refusing to downgrade $current_version"
-			candidate_version=""
+		if [[ "$release_count" == "0" ]]; then
+			log "Joomla $major: no stable release entry; keeping $current_version"
+		elif [[ "$release_count" != "1" ]]; then
+			fail "Joomla stable release response contains duplicate entries for major $major"
+		else
+			candidate_version="$(
+				jq -r --arg branch "Joomla! $major" \
+					'.branches[] | select(.branch == $branch) | .version' \
+					"$RELEASES_SOURCE"
+			)"
+
+			if [[ "$candidate_version" =~ ^${major}\.[0-9]+\.[0-9]+[-+] ]]; then
+				log "Joomla $major: upstream entry $candidate_version is not stable; ignoring it"
+				candidate_version=""
+			elif [[ ! "$candidate_version" =~ ^${major}\.[0-9]+\.[0-9]+$ ]]; then
+				fail "Invalid stable Joomla $major version from upstream: $candidate_version"
+			elif [[ "$candidate_version" == "$current_version" ]]; then
+				log "Joomla $major: $current_version is current"
+				candidate_version=""
+			elif ! version_is_newer "$candidate_version" "$current_version"; then
+				log "Joomla $major: upstream reports older $candidate_version; refusing to downgrade $current_version"
+				candidate_version=""
+			fi
 		fi
+
 	fi
 
 	if ! collect_matrix_records "$major" "$current_version" "current"; then

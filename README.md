@@ -320,7 +320,7 @@ This repository uses GitHub Actions to run the build engine automatically.
 Every six hours, the release poller:
 
 1. Reads Joomla's official stable-release feed
-2. Checks every configured PHP × variant tag on the official Joomla Docker Hub repository
+2. Reads every configured PHP × variant index directly from the official `library/joomla` Docker registry and verifies its SHA-256 digest
 3. Waits successfully, without a repository change or failed workflow, while any candidate tag is unavailable
 4. Atomically updates `conf/versions.json` and `conf/upstream-images.json` only when a complete matrix is ready
 5. Checks the latest stable MCP package against eligible images and successful build records
@@ -328,6 +328,25 @@ Every six hours, the release poller:
 
 Digest-only changes are deliberate rebuild triggers, so refreshed upstream base
 images receive the same verification and publication path as new Joomla releases.
+
+The published registry index defines the available Linux platforms. The poller
+verifies the raw index against its `Docker-Content-Digest`, records each runnable
+platform's manifest digest, and ignores attestation descriptors. Architectures
+listed in `docker-library/official-images` may still be awaiting publication, so
+they do not block an otherwise usable tag. Every configured tag must be published;
+missing tags, invalid manifests, or digest mismatches cannot become build inputs.
+Later platform additions or removals change the saved state and trigger a rebuild.
+
+If you edit `conf/versions.json`, the builder automatically refreshes missing
+base-image records before generating or building images. You can also refresh
+all currently configured tags without changing Joomla versions:
+
+```bash
+./src/bin/check-joomla-releases.sh --refresh-current
+```
+
+Commit `conf/versions.json` and `conf/upstream-images.json` together after a manual
+refresh. Changes to either file trigger the publisher on `master`.
 
 ### Build triggers
 
@@ -345,7 +364,7 @@ images receive the same verification and publication path as new Joomla releases
 4. Registers cross-architecture emulation and creates a Buildx builder
 5. Authenticates with Docker
 6. Runs `./src/bin/joomengine.sh`
-7. Commits only the generated image contexts and build-state files
+7. Commits the generated image contexts, build-state files, and any refreshed upstream digests
 
 Pull requests also run ShellCheck, actionlint, JSON validation, and deterministic
 tests for release selection, compatibility, build state, tags, and startup. Image

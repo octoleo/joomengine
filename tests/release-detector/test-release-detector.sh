@@ -315,19 +315,19 @@ test_complete_multi_platform_candidate_advances() {
 		'.tags | has("4.4.14-php8.1-apache")' "false"
 }
 
-test_candidate_platform_mismatch_waits() {
-	local mismatch
+test_published_platform_set_is_authoritative() {
+	local platform_change
 	local case_dir
+	local expected_count
 
-	for mismatch in missing unexpected; do
-		case_dir="$(prepare_multi_platform_case "candidate-$mismatch")"
-		cp "$case_dir/versions.json" "$case_dir/versions.before"
-		cp "$case_dir/upstream-images.json" "$case_dir/upstream-images.before"
+	for platform_change in removed added; do
+		case_dir="$(prepare_multi_platform_case "published-$platform_change")"
 
-		if [[ "$mismatch" == "missing" ]]; then
+		if [[ "$platform_change" == "removed" ]]; then
 			jq '(.results[] | select(.name == "4.4.15-php8.1-apache") | .images) |=
 				map(select(.architecture != "ppc64le"))' \
 				"$FIXTURES/docker-tags-multi-platform.json" > "$case_dir/docker-tags.json"
+			expected_count="5"
 		else
 			jq '(.results[] | select(.name == "4.4.15-php8.1-apache") | .images) += [{
 				"architecture": "riscv64",
@@ -335,6 +335,7 @@ test_candidate_platform_mismatch_waits() {
 				"status": "active",
 				"digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
 			}]' "$FIXTURES/docker-tags-multi-platform.json" > "$case_dir/docker-tags.json"
+			expected_count="7"
 		fi
 
 		run_detector \
@@ -345,34 +346,36 @@ test_candidate_platform_mismatch_waits() {
 			"$case_dir/github-output" \
 			"$FIXTURES/official-images-multi-platform.txt"
 
-		cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "$mismatch candidate platform set advanced the release"
-		cmp -s "$case_dir/upstream-images.before" "$case_dir/upstream-images.json" || fail "$mismatch candidate platform set changed state"
-		assert_file_contains "$case_dir/github-output" "waiting_majors=4"
+		assert_json_value "$case_dir/versions.json" '.["4"].joomla' "4.4.15"
+		assert_json_value "$case_dir/upstream-images.json" \
+			'.tags["4.4.15-php8.1-apache"].platforms | length' "$expected_count"
+		assert_file_contains "$case_dir/github-output" "updated_majors=4"
+		assert_file_contains "$case_dir/github-output" "waiting_majors="
 	done
 }
 
-test_current_platform_mismatch_is_an_error() {
+test_current_platform_change_refreshes_state() {
 	local case_dir
-	case_dir="$(prepare_multi_platform_case current-platform-missing)"
+	case_dir="$(prepare_multi_platform_case current-platform-change)"
 	cp "$case_dir/versions.json" "$case_dir/versions.before"
-	cp "$case_dir/upstream-images.json" "$case_dir/upstream-images.before"
 	jq '(.results[] | select(.name == "4.4.14-php8.1-apache") | .images) |=
 		map(select(.architecture != "ppc64le"))' \
 		"$FIXTURES/docker-tags-multi-platform.json" > "$case_dir/docker-tags.json"
 
-	if run_detector \
+	run_detector \
 		"$case_dir/versions.json" \
 		"$case_dir/upstream-images.json" \
 		"$FIXTURES/releases-multi-platform-current.json" \
 		"$case_dir/docker-tags.json" \
 		"$case_dir/github-output" \
-		"$FIXTURES/official-images-multi-platform.txt" \
-		2>/dev/null; then
-		fail "an incomplete current platform set succeeded"
-	fi
+		"$FIXTURES/official-images-multi-platform.txt"
 
-	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "incomplete current platforms changed versions"
-	cmp -s "$case_dir/upstream-images.before" "$case_dir/upstream-images.json" || fail "incomplete current platforms changed state"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "platform change rewrote versions"
+	assert_json_value "$case_dir/upstream-images.json" \
+		'.tags["4.4.14-php8.1-apache"].platforms | has("linux/ppc64le")' "false"
+	assert_json_value "$case_dir/upstream-images.json" \
+		'.tags["4.4.14-php8.1-apache"].platforms | length' "5"
+	assert_file_contains "$case_dir/github-output" "digests_changed=yes"
 }
 
 test_duplicate_canonical_platform_is_an_error() {
@@ -436,7 +439,7 @@ test_schema_one_migrates_legacy_platforms_once() {
 	assert_file_contains "$case_dir/github-output-second" "changed=no"
 }
 
-test_authoritative_policy_can_remove_a_platform() {
+test_published_index_can_remove_a_platform() {
 	local case_dir
 	case_dir="$(prepare_multi_platform_case authoritative-removal)"
 	jq '.tags["4.4.14-php8.1-apache"].platforms["linux/riscv64"] =
@@ -457,57 +460,59 @@ test_authoritative_policy_can_remove_a_platform() {
 	assert_file_contains "$case_dir/github-output" "digests_changed=yes"
 }
 
-test_invalid_official_metadata_and_state_are_rejected() {
+test_invalid_fixture_and_state_are_rejected() {
 	local case_dir
 	local invalid_kind
 
-	for invalid_kind in unknown-architecture duplicate-stanza invalid-state-platform; do
+	for invalid_kind in index-digest platform-digest platform-name arm-variant invalid-state-platform; do
 		case_dir="$(prepare_multi_platform_case "$invalid_kind")"
-		cp "$case_dir/upstream-images.json" "$case_dir/upstream-images.before"
-		cp "$FIXTURES/official-images-multi-platform.txt" "$case_dir/official-images.txt"
+		cp "$FIXTURES/docker-tags-multi-platform.json" "$case_dir/docker-tags.json"
 
 		case "$invalid_kind" in
-			unknown-architecture)
-			awk '{sub("ppc64le", "not/an/architecture"); print}' \
-				"$case_dir/official-images.txt" > "$case_dir/official-images.invalid"
-			mv "$case_dir/official-images.invalid" "$case_dir/official-images.txt"
-			;;
-			duplicate-stanza)
-			printf '%s\n' \
-				'' \
-				'Tags: 4.4.14-php8.1-apache' \
-				'Architectures: amd64' >> "$case_dir/official-images.txt"
-			;;
+			index-digest)
+				jq '.results[0].digest = "sha256:invalid"' "$case_dir/docker-tags.json" > "$case_dir/invalid.json"
+				mv "$case_dir/invalid.json" "$case_dir/docker-tags.json"
+				;;
+			platform-digest)
+				jq '.results[0].images[1].digest = "sha256:invalid"' "$case_dir/docker-tags.json" > "$case_dir/invalid.json"
+				mv "$case_dir/invalid.json" "$case_dir/docker-tags.json"
+				;;
+			platform-name)
+				jq '.results[0].images[1].architecture = "invalid/architecture"' "$case_dir/docker-tags.json" > "$case_dir/invalid.json"
+				mv "$case_dir/invalid.json" "$case_dir/docker-tags.json"
+				;;
+			arm-variant)
+				jq '.results[0].images[2].variant = "invalid"' "$case_dir/docker-tags.json" > "$case_dir/invalid.json"
+				mv "$case_dir/invalid.json" "$case_dir/docker-tags.json"
+				;;
 			invalid-state-platform)
-			jq '.tags["4.4.14-php8.1-apache"].platforms["linux/unknown"] =
-				"sha256:7777777777777777777777777777777777777777777777777777777777777777"' \
-				"$case_dir/upstream-images.json" > "$case_dir/upstream-images.invalid"
-			mv "$case_dir/upstream-images.invalid" "$case_dir/upstream-images.json"
-			;;
+				jq '.tags["4.4.14-php8.1-apache"].platforms["linux/unknown"] =
+					"sha256:7777777777777777777777777777777777777777777777777777777777777777"' \
+					"$case_dir/upstream-images.json" > "$case_dir/invalid.json"
+				mv "$case_dir/invalid.json" "$case_dir/upstream-images.json"
+				;;
 		esac
+		cp "$case_dir/upstream-images.json" "$case_dir/upstream-images.before"
+		cp "$case_dir/versions.json" "$case_dir/versions.before"
 
 		if run_detector \
 			"$case_dir/versions.json" \
 			"$case_dir/upstream-images.json" \
 			"$FIXTURES/releases-multi-platform-current.json" \
-			"$FIXTURES/docker-tags-multi-platform.json" \
+			"$case_dir/docker-tags.json" \
 			"$case_dir/github-output" \
-			"$case_dir/official-images.txt" \
 			2>/dev/null; then
 			fail "$invalid_kind succeeded"
 		fi
 
-		if [[ "$invalid_kind" != "invalid-state-platform" ]]; then
-			cmp -s "$case_dir/upstream-images.before" "$case_dir/upstream-images.json" || fail "$invalid_kind changed state"
-		fi
+		cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "$invalid_kind changed versions"
+		cmp -s "$case_dir/upstream-images.before" "$case_dir/upstream-images.json" || fail "$invalid_kind changed state"
 	done
 }
 
-test_candidate_without_official_metadata_waits() {
+test_candidate_does_not_require_official_metadata() {
 	local case_dir
 	case_dir="$(prepare_multi_platform_case candidate-metadata-missing)"
-	cp "$case_dir/versions.json" "$case_dir/versions.before"
-	cp "$case_dir/upstream-images.json" "$case_dir/upstream-images.before"
 	awk 'BEGIN { RS = ""; ORS = "\n\n" } /Tags: 4.4.14-php8.1-apache/ { print }' \
 		"$FIXTURES/official-images-multi-platform.txt" > "$case_dir/current-only-official-images.txt"
 
@@ -519,9 +524,28 @@ test_candidate_without_official_metadata_waits() {
 		"$case_dir/github-output" \
 		"$case_dir/current-only-official-images.txt"
 
-	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "candidate without official metadata advanced"
-	cmp -s "$case_dir/upstream-images.before" "$case_dir/upstream-images.json" || fail "candidate without official metadata changed state"
-	assert_file_contains "$case_dir/github-output" "waiting_majors=4"
+	assert_json_value "$case_dir/versions.json" '.["4"].joomla' "4.4.15"
+	assert_file_contains "$case_dir/github-output" "updated_majors=4"
+}
+
+test_refresh_current_does_not_upgrade_versions() {
+	local case_dir
+	case_dir="$(prepare_multi_platform_case refresh-current)"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	rm "$case_dir/upstream-images.json"
+
+	GITHUB_OUTPUT="$case_dir/github-output" "$DETECTOR" \
+		--quiet --refresh-current \
+		--versions-file "$case_dir/versions.json" \
+		--state-file "$case_dir/upstream-images.json" \
+		--releases-file "$FIXTURES/releases-multi-platform-new.json" \
+		--docker-tags-file "$FIXTURES/docker-tags-multi-platform.json"
+
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "refresh-current advanced Joomla version"
+	assert_json_value "$case_dir/upstream-images.json" '.tags | keys | join(",")' "4.4.14-php8.1-apache"
+	assert_file_contains "$case_dir/github-output" "versions_changed=no"
+	assert_file_contains "$case_dir/github-output" "digests_changed=yes"
+	assert_file_contains "$case_dir/github-output" "updated_majors="
 }
 
 test_no_change
@@ -543,18 +567,21 @@ echo "ok - invalid upstream data fails without mutation"
 test_platform_normalization_is_deterministic
 echo "ok - platform aliases, ARM variants, ordering, and attestations normalize deterministically"
 test_complete_multi_platform_candidate_advances
-echo "ok - a complete authoritative multi-platform candidate advances"
-test_candidate_platform_mismatch_waits
-echo "ok - missing and unexpected candidate platforms keep a release pending"
-test_current_platform_mismatch_is_an_error
-echo "ok - a current tag that violates authoritative platform policy fails"
+echo "ok - a published multi-platform candidate advances"
+test_published_platform_set_is_authoritative
+echo "ok - published platforms determine readiness independently of planned architectures"
+test_current_platform_change_refreshes_state
+echo "ok - current tags refresh the actually published platform set"
 test_duplicate_canonical_platform_is_an_error
 echo "ok - duplicate canonical Docker platforms fail without mutation"
 test_schema_one_migrates_legacy_platforms_once
 echo "ok - schema one migrates legacy tags once and schema two remains stable"
-test_authoritative_policy_can_remove_a_platform
-echo "ok - authoritative metadata permits intentional platform removal"
-test_invalid_official_metadata_and_state_are_rejected
-echo "ok - unknown or duplicate platform policy and invalid state are rejected"
-test_candidate_without_official_metadata_waits
-echo "ok - candidates cannot advance before authoritative metadata is published"
+test_published_index_can_remove_a_platform
+echo "ok - a published index refresh removes stale platform records"
+test_invalid_fixture_and_state_are_rejected
+echo "ok - invalid digests, platform names, ARM variants, and state fail without mutation"
+test_candidate_does_not_require_official_metadata
+echo "ok - published candidate tags do not depend on official-images metadata"
+test_refresh_current_does_not_upgrade_versions
+echo "ok - refresh-current repairs missing digest state without upgrading Joomla"
+bash "$TEST_DIR/test-registry.sh"

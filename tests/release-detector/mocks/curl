@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Isolate registry integration tests from every real network endpoint. Each
+# response body is hashed exactly as served, including whitespace/newlines.
+output=""
+headers=""
+write_out=""
+url=""
+authorization=""
+accept=""
+fail_http="no"
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--output|-o) output="$2"; shift 2 ;;
+		--dump-header|-D) headers="$2"; shift 2 ;;
+		--write-out|-w) write_out="$2"; shift 2 ;;
+		--header|-H)
+			case "$2" in
+				Authorization:*) authorization="$2" ;;
+				Accept:*) accept="$2" ;;
+			esac
+			shift 2 ;;
+		--url) url="$2"; shift 2 ;;
+		--retry|--retry-delay|--connect-timeout|--max-time|--retry-max-time)
+			shift 2 ;;
+		--fail|--fail-with-body) fail_http="yes"; shift ;;
+		--silent|--show-error|--location|--retry-connrefused|--retry-all-errors)
+			shift ;;
+		https://*) url="$1"; shift ;;
+		*) echo "Unexpected mock curl argument: $1" >&2; exit 90 ;;
+	esac
+done
+
+printf '%s\n' "$url" >> "$MOCK_REGISTRY_DIR/requests.log"
+[[ -n "$output" ]] || { echo "Missing curl output path" >&2; exit 90; }
+http_status="200"
+curl_status="0"
+
+case "$url" in
+	https://auth.docker.io/token\?*)
+		if [[ -f "$MOCK_REGISTRY_DIR/token.json" ]]; then
+			cp "$MOCK_REGISTRY_DIR/token.json" "$output"
+		else
+			printf '%s\n' '{"token":"registry-test-token"}' > "$output"
+		fi
+		[[ ! -f "$MOCK_REGISTRY_DIR/token.status" ]] || http_status="$(cat "$MOCK_REGISTRY_DIR/token.status")"
+		;;
+	https://registry-1.docker.io/v2/library/joomla/manifests/*)
+		[[ "$authorization" == "Authorization: Bearer registry-test-token" ]] || {
+			echo "Missing registry authorization" >&2; exit 90;
+		}
+		[[ "$accept" == *application/vnd.oci.image.index.v1+json* &&
+			"$accept" == *application/vnd.docker.distribution.manifest.list.v2+json* ]] || {
+			echo "Missing supported registry media types" >&2; exit 90;
+		}
+		tag="${url##*/}"
+		if [[ -f "$MOCK_REGISTRY_DIR/$tag.json" ]]; then
+			cp "$MOCK_REGISTRY_DIR/$tag.json" "$output"
+		else
+			printf '%s\n' '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$output"
+			http_status="404"
+		fi
+		[[ ! -f "$MOCK_REGISTRY_DIR/$tag.status" ]] || http_status="$(cat "$MOCK_REGISTRY_DIR/$tag.status")"
+		[[ ! -f "$MOCK_REGISTRY_DIR/$tag.exit" ]] || curl_status="$(cat "$MOCK_REGISTRY_DIR/$tag.exit")"
+		if [[ -n "$headers" ]]; then
+			digest="sha256:$(sha256sum "$output" | cut -d ' ' -f 1)"
+			[[ ! -f "$MOCK_REGISTRY_DIR/$tag.digest" ]] || digest="$(cat "$MOCK_REGISTRY_DIR/$tag.digest")"
+			printf 'HTTP/1.1 %s Registry Response\r\ncontent-type: application/json\r\n' "$http_status" > "$headers"
+			if [[ ! -f "$MOCK_REGISTRY_DIR/$tag.no-digest" ]]; then
+				printf 'dOcKeR-CoNtEnT-DiGeSt: %s\r\n' "$digest" >> "$headers"
+			fi
+			printf '\r\n' >> "$headers"
+		fi
+		;;
+	*) echo "Unexpected network request in registry test: $url" >&2; exit 90 ;;
+esac
+
+[[ -z "$write_out" ]] || printf '%s' "$http_status"
+if [[ "$curl_status" != "0" ]]; then
+	exit "$curl_status"
+fi
+if [[ "$fail_http" == "yes" && "$http_status" -ge 400 ]]; then
+	exit 22
+fi

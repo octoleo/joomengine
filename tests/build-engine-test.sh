@@ -224,6 +224,34 @@ cp "$ENGINE" "$CASE_DIR/src/bin/joomengine.sh"
 cp "$REPO_ROOT/src/lib/mcp-package.sh" "$CASE_DIR/src/lib/mcp-package.sh"
 cp "$REPO_ROOT/src/docker/Dockerfile.template" "$CASE_DIR/src/docker/Dockerfile.template"
 cp "$REPO_ROOT/src/docker/docker-entrypoint.sh" "$CASE_DIR/src/docker/docker-entrypoint.sh"
+cat > "$CASE_DIR/src/bin/check-joomla-releases.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$JOOMENGINE_REFRESH_TRACE"
+[[ ! -v GITHUB_OUTPUT ]] || {
+	printf 'detector inherited parent GITHUB_OUTPUT\n' >> "$GITHUB_OUTPUT"
+	exit 2
+}
+refresh_current=no
+versions_file=""
+state_file=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--refresh-current) refresh_current=yes; shift ;;
+	--versions-file) versions_file="$2"; shift 2 ;;
+	--state-file) state_file="$2"; shift 2 ;;
+	*) echo "unexpected refresh argument: $1" >&2; exit 2 ;;
+	esac
+done
+[[ "$refresh_current" == yes && -s "$versions_file" && -n "$state_file" ]] || exit 2
+[[ "${JOOMENGINE_REFRESH_MODE:-success}" != failure ]] || exit 1
+if [[ "${JOOMENGINE_REFRESH_MODE:-success}" == incomplete ]]; then
+	jq '.tags |= with_entries(select(.key | endswith("-fpm") | not))' "$JOOMENGINE_REFRESH_STATE" > "$state_file"
+else
+	cp "$JOOMENGINE_REFRESH_STATE" "$state_file"
+fi
+SH
+chmod +x "$CASE_DIR/src/bin/check-joomla-releases.sh"
 printf '# deterministic jq template fixture\n' > "$CASE_DIR/bashbrew/jq-template.awk"
 printf 'obsolete context\n' > "$CASE_DIR/images/jcb6.0.0/j6.0.0/php8.4/apache/obsolete"
 printf 'https://example.test/com_componentbuilder.zip\n' > "$CASE_DIR/jcb-url"
@@ -231,6 +259,8 @@ printf '[]\n' > "$CASE_DIR/conf/maintainers.json"
 printf 'obsolete build record\n' > "$CASE_DIR/conf/hashes.txt"
 export JOOMENGINE_MCP_XML_FILE="$CASE_DIR/mcp-update.xml"
 export JOOMENGINE_MCP_FETCH_TRACE="$CASE_DIR/mcp-fetch.trace"
+export JOOMENGINE_REFRESH_TRACE="$CASE_DIR/refresh.trace"
+export JOOMENGINE_REFRESH_STATE="$CASE_DIR/refresh-state.json"
 JOOMENGINE_REAL_XMLSTARLET="$(command -v xmlstarlet)"
 export JOOMENGINE_REAL_XMLSTARLET
 
@@ -300,6 +330,7 @@ set_alias_topology_hash() {
 run_engine_args() {
 	: > "$TRACE_FILE"
 	: > "$JOOMENGINE_MCP_FETCH_TRACE"
+	: > "$JOOMENGINE_REFRESH_TRACE"
 	if ! JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 	JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
@@ -325,6 +356,7 @@ run_engine() {
 }
 
 run_engine
+[[ ! -s "$JOOMENGINE_REFRESH_TRACE" ]] || fail 'complete verified upstream state unnecessarily refreshed'
 assert_contains "$TRACE_FILE" 'buildx inspect --bootstrap'
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/amd64 --tag octoleo/joomengine:6.0.0-php8.4-apache --load'
 assert_contains \
@@ -359,6 +391,72 @@ run_engine
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$first_hashes" ]] || fail 'no-op changed hash state'
 assert_contains "$CASE_DIR/engine.out" 'No changed image inputs detected'
 echo 'ok - unchanged inputs are a true build no-op'
+
+# A manual Joomla bump can precede the release detector committing its matching
+# digests. Refresh only that configured matrix before consuming build inputs.
+mkdir "$CASE_DIR/before-refresh"
+for saved_file in versions.json upstream-images.json hashes.txt manifest.ndjson; do
+	cp "$CASE_DIR/conf/$saved_file" "$CASE_DIR/before-refresh/$saved_file"
+done
+cp -a "$CASE_DIR/images" "$CASE_DIR/before-refresh/images"
+jq '."6".joomla = "6.1.4"' "$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+jq '.tags["6.1.4-php8.4-apache"] = .tags["6.1.3-php8.4-apache"] | del(.tags["6.1.3-php8.4-apache"])' \
+	"$CASE_DIR/conf/upstream-images.json" > "$JOOMENGINE_REFRESH_STATE"
+printf 'parent-output=preserved\n' > "$CASE_DIR/github-output"
+GITHUB_OUTPUT="$CASE_DIR/github-output" run_engine
+[[ "$(wc -l < "$JOOMENGINE_REFRESH_TRACE")" -eq 1 ]] || fail 'manual version bump did not refresh exactly once'
+assert_contains "$JOOMENGINE_REFRESH_TRACE" "--refresh-current --versions-file $CASE_DIR/conf/versions.json --state-file $CASE_DIR/conf/upstream-images.json"
+[[ "$(<"$CASE_DIR/github-output")" == 'parent-output=preserved' ]] || fail 'refresh contaminated the parent workflow outputs'
+assert_contains "$TRACE_FILE" 'buildx build --pull'
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.4/php8.4/apache/Dockerfile" \
+	'FROM joomla:6.1.4-php8.4-apache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+jq -s -e 'length == 2 and all(.[]; .joomla == "6.1.4")' \
+	"$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'manual version bump used stale upstream image records'
+echo 'ok - manual Joomla bumps refresh verified digests without altering parent workflow outputs'
+
+rm "$CASE_DIR/conf/upstream-images.json"
+run_engine
+[[ "$(wc -l < "$JOOMENGINE_REFRESH_TRACE")" -eq 1 ]] || fail 'missing upstream state did not bootstrap exactly once'
+cmp -s "$JOOMENGINE_REFRESH_STATE" "$CASE_DIR/conf/upstream-images.json" || fail 'bootstrap did not persist the verified upstream state'
+[[ ! -s "$TRACE_FILE" ]] || fail 'restoring identical verified digests unnecessarily rebuilt images'
+echo 'ok - missing upstream state is bootstrapped before build input selection'
+
+cp "$CASE_DIR/conf/hashes.txt" "$CASE_DIR/before-refresh/refreshed-hashes.txt"
+cp "$CASE_DIR/conf/manifest.ndjson" "$CASE_DIR/before-refresh/refreshed-manifest.ndjson"
+jq '."6".variants += ["fpm"]' "$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+jq '.tags["6.1.4-php8.4-fpm"] = .tags["6.1.4-php8.4-apache"]' \
+	"$JOOMENGINE_REFRESH_STATE" > "$CASE_DIR/refresh-state.next"
+mv "$CASE_DIR/refresh-state.next" "$JOOMENGINE_REFRESH_STATE"
+for refresh_mode in failure incomplete; do
+	jq 'del(.tags["6.1.4-php8.4-fpm"])' "$JOOMENGINE_REFRESH_STATE" > "$CASE_DIR/conf/upstream-images.json"
+	if JOOMENGINE_EXPECT_FAILURE=yes JOOMENGINE_REFRESH_MODE="$refresh_mode" run_engine; then
+		fail "$refresh_mode upstream refresh returned success"
+	fi
+	[[ "$(wc -l < "$JOOMENGINE_REFRESH_TRACE")" -eq 1 ]] || fail "$refresh_mode refresh was not attempted exactly once"
+	[[ ! -s "$TRACE_FILE" ]] || fail "$refresh_mode refresh invoked Docker"
+	[[ ! -s "$JOOMENGINE_MCP_FETCH_TRACE" ]] || fail "$refresh_mode refresh fetched MCP metadata before validation"
+	cmp -s "$CASE_DIR/before-refresh/refreshed-hashes.txt" "$CASE_DIR/conf/hashes.txt" || fail "$refresh_mode refresh changed successful build hashes"
+	cmp -s "$CASE_DIR/before-refresh/refreshed-manifest.ndjson" "$CASE_DIR/conf/manifest.ndjson" || fail "$refresh_mode refresh changed the build manifest"
+done
+echo 'ok - failed or incomplete digest refresh stops before Docker or successful build state changes'
+
+printf '{invalid state\n' > "$CASE_DIR/conf/upstream-images.json"
+if JOOMENGINE_EXPECT_FAILURE=yes run_engine; then
+	fail 'malformed existing upstream state returned success'
+fi
+[[ ! -s "$JOOMENGINE_REFRESH_TRACE" ]] || fail 'malformed existing upstream state was silently refreshed'
+[[ ! -s "$TRACE_FILE" && ! -s "$JOOMENGINE_MCP_FETCH_TRACE" ]] || fail 'malformed upstream state caused downstream work'
+cmp -s "$CASE_DIR/before-refresh/refreshed-hashes.txt" "$CASE_DIR/conf/hashes.txt" || fail 'malformed upstream state changed successful build hashes'
+cmp -s "$CASE_DIR/before-refresh/refreshed-manifest.ndjson" "$CASE_DIR/conf/manifest.ndjson" || fail 'malformed upstream state changed the build manifest'
+echo 'ok - malformed existing upstream state fails closed before refresh or build work'
+
+for saved_file in versions.json upstream-images.json hashes.txt manifest.ndjson; do
+	cp "$CASE_DIR/before-refresh/$saved_file" "$CASE_DIR/conf/$saved_file"
+done
+rm -rf -- "$CASE_DIR/images"
+cp -a "$CASE_DIR/before-refresh/images" "$CASE_DIR/images"
 
 plain_hash="$(awk '$11 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")"
 sed -i 's/1\.0\.1/1.0.2/g' "$JOOMENGINE_MCP_XML_FILE"

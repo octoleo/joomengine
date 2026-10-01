@@ -11,6 +11,9 @@ on:
     paths:
       - ".github/workflows/joomengine.yml"
       - "conf/maintainers.json"
+      - "conf/versions.json"
+      - "conf/upstream-images.json"
+      - "src/bin/check-joomla-releases.sh"
       - "src/bin/joomengine.sh"
       - "src/lib/**"
       - "src/docker/**"
@@ -87,7 +90,7 @@ jobs:
           for status_line in "${status_lines[@]}"; do
             path="${status_line:3}"
             case "$path" in
-              conf/hashes.txt|conf/manifest.ndjson|images/*)
+              conf/hashes.txt|conf/manifest.ndjson|conf/upstream-images.json|images/*)
                 changed=yes
                 ;;
               *)
@@ -98,8 +101,9 @@ jobs:
             esac
           done
 
-          git diff --check -- conf/hashes.txt conf/manifest.ndjson images
+          git diff --check -- conf/hashes.txt conf/manifest.ndjson conf/upstream-images.json images
           jq -e . conf/manifest.ndjson >/dev/null
+          jq -e . conf/upstream-images.json >/dev/null
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
       - name: Commit generated image state
@@ -112,7 +116,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -- conf/hashes.txt conf/manifest.ndjson images
+          git add -- conf/hashes.txt conf/manifest.ndjson conf/upstream-images.json images
           git diff --cached --check
           git commit -m "chore(images): refresh generated contexts (${build_date})"
 

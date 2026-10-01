@@ -202,12 +202,6 @@ if [[ ! -f "$MAINTAINERS_JSON_FILE" ]]; then
 	exit 1
 fi
 
-if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]]; then
-	echo "[ERROR] Unable to determine verified upstream image state" >&2
-	echo "Resolved UPSTREAM_IMAGES_FILE=$UPSTREAM_IMAGES_FILE" >&2
-	exit 1
-fi
-
 DOCKERFILE_TEMPLATE="$REPO_ROOT/src/docker/Dockerfile.template"
 DOCKER_ENTRYPOINT="$REPO_ROOT/src/docker/docker-entrypoint.sh"
 MCP_HELPER="$REPO_ROOT/src/lib/mcp-package.sh"
@@ -250,6 +244,62 @@ for cmd in jq curl xmlstarlet gawk grep sort sha256sum find; do
 	}
 done
 
+validate_upstream_image_state() {
+	jq -e '
+		type == "object" and
+		.schema == 2 and
+		.repository == "library/joomla" and
+		(.tags | type == "object") and
+		all(
+			.tags | to_entries[];
+			(.key | type == "string") and
+			(.value | type == "object") and
+			(.value.index_digest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
+			(.value.platforms | type == "object" and length > 0) and
+			all(
+				.value.platforms | to_entries[];
+				(.key | test("^linux/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$")) and
+				(.value | type == "string" and test("^sha256:[a-f0-9]{64}$"))
+			)
+		)
+	' "$UPSTREAM_IMAGES_FILE" >/dev/null
+}
+
+# A manually changed Joomla/PHP/variant matrix can be newer than the saved
+# digest state. Resolve the complete configured matrix before any build work;
+# the release detector preserves these versions with --refresh-current.
+upstream_state_covers_matrix() {
+	jq -e --slurpfile versions "$VERSIONS_JSON_FILE" '
+		.tags as $tags |
+		[$versions[0][] | .joomla as $joomla |
+			.php[] as $php | .variants[] |
+			($joomla + "-php" + $php + "-" + .)] |
+		length > 0 and all(.[]; $tags[.] != null)
+	' "$UPSTREAM_IMAGES_FILE" >/dev/null
+}
+
+if [[ -e "$UPSTREAM_IMAGES_FILE" ]] && {
+	[[ ! -f "$UPSTREAM_IMAGES_FILE" ]] || ! validate_upstream_image_state;
+}; then
+	echo "[ERROR] Invalid upstream image state: $UPSTREAM_IMAGES_FILE" >&2
+	exit 1
+fi
+
+if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]] || ! upstream_state_covers_matrix; then
+	echo "Refreshing verified Joomla image digests for the configured build matrix."
+	if ! env -u GITHUB_OUTPUT "$SCRIPT_DIR/check-joomla-releases.sh" \
+		--refresh-current \
+		--versions-file "$VERSIONS_JSON_FILE" \
+		--state-file "$UPSTREAM_IMAGES_FILE"; then
+		echo "[ERROR] Unable to refresh verified Joomla base images; no images were built." >&2
+		exit 1
+	fi
+	if ! validate_upstream_image_state || ! upstream_state_covers_matrix; then
+		echo "[ERROR] Refreshed upstream image state does not cover the configured Joomla matrix." >&2
+		exit 1
+	fi
+fi
+
 if [[ -z "${BASHBREW_SCRIPTS:-}" ]] && [[ ! -f "$AWK_SCRIPT" || "$SCRIPT_PATH" -nt "$AWK_SCRIPT" ]]; then
 	AWK_TMP="$(mktemp "${AWK_SCRIPT}.download.XXXXXX")"
 	trap 'rm -f -- "$AWK_TMP"' EXIT
@@ -265,28 +315,6 @@ if [[ -z "${BASHBREW_SCRIPTS:-}" ]] && [[ ! -f "$AWK_SCRIPT" || "$SCRIPT_PATH" -
 		'https://github.com/docker-library/bashbrew/raw/5f0c26381fb7cc78b2d217d58007800bdcfbcfa1/scripts/jq-template.awk'
 	mv "$AWK_TMP" "$AWK_SCRIPT"
 	trap - EXIT
-fi
-
-if ! jq -e '
-	type == "object" and
-	.schema == 2 and
-	.repository == "library/joomla" and
-	(.tags | type == "object") and
-	all(
-		.tags | to_entries[];
-		(.key | type == "string") and
-		(.value | type == "object") and
-		(.value.index_digest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
-		(.value.platforms | type == "object" and length > 0) and
-		all(
-			.value.platforms | to_entries[];
-			(.key | test("^linux/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$")) and
-			(.value | type == "string" and test("^sha256:[a-f0-9]{64}$"))
-		)
-	)
-' "$UPSTREAM_IMAGES_FILE" >/dev/null; then
-	echo "[ERROR] Invalid upstream image state: $UPSTREAM_IMAGES_FILE" >&2
-	exit 1
 fi
 
 # Resolve one verified stable MCP release for this entire batch. Only MCP
