@@ -94,7 +94,7 @@
 			}
 		},
 		"5.4.9-php8.2-fpm": {
-			"index_digest": "sha256:3f90bf3e03becf491c53013f6602300ba04dd459aa756510b21476205828225e",
+			"index_digest": "sha256:bf0b61535eb61a24c0f448e86118aa51beb5342ab6aab4542a56d0143f2584b7",
 			"platforms": {
 				"linux/386": "sha256:de2fb80e6fb58409083e52ab430ecf74954516b400cd17e84b86c135a2033da7",
 				"linux/amd64": "sha256:a929a9545b96045dae3cfdfab80c322ccb1e1c43b1b56e67f0c45ba1d531d2ee",
@@ -102,7 +102,7 @@
 				"linux/arm/v7": "sha256:98aa5919c90f56887904e1170b295dc45ba944a66cc43e2a7d5d7f6c72314b52",
 				"linux/arm64/v8": "sha256:4deebc9acaf3a7a454aeb8a23f464e237408ec8a49f178df6f1c6f5323ffa707",
 				"linux/ppc64le": "sha256:b3be8c381ab982cb3dd831e2b3bae06fcc51c928e6177698452b36142773ef38",
-				"linux/riscv64": "sha256:6493795a1fb6d3e20000ec0e523391b2f04b1bac9f17ae8e3e29c0b68e52ce71",
+				"linux/riscv64": "sha256:feda4b1c268b53244c326b5cd647b235fc902d9f272aeb4fd56c0cbd85deade5",
 				"linux/s390x": "sha256:99e3529ac370f2e62aee57ad6806f093e5de1dec64d6380a1348ca1fc6138141"
 			}
 		},
@@ -211,7 +211,7 @@
 			}
 		},
 		"6.1.4-php8.4-fpm": {
-			"index_digest": "sha256:008712b97db48feeb7d21997015f6a16da4169a08fd90e8065932e5afe6095c3",
+			"index_digest": "sha256:2b1421965721a6a9979745f4b78e59578fc6502176ae3feaed7dc90c3498f236",
 			"platforms": {
 				"linux/386": "sha256:3120dbe6a62f2b47338ad46ea6fcc9c90c2c586edcf8d0fa87403a4bb2699fa5",
 				"linux/amd64": "sha256:334c7c4049b57e0e901c04cbcc468cbe4ce7aec90e00b3d1429578136f20cd11",
@@ -219,7 +219,7 @@
 				"linux/arm/v7": "sha256:eca0c57581eaf2c38d46274835644049ecea52d31f1282e73e61710e9d09bb67",
 				"linux/arm64/v8": "sha256:3519a3ba6c4bb6ad7b7502d9148de5cbf8b09ff1c93861854f5efd073e0c77a7",
 				"linux/ppc64le": "sha256:acba60a5cf56d4bec1fb1f133cf8ea639aedd0897adae87acf49a17b9e8db1a2",
-				"linux/riscv64": "sha256:a6023d0b9abf169a83bac8e29aefddbb49a8eb73415f0165e4cec3e498e72322",
+				"linux/riscv64": "sha256:f6d65ca4be003902ed9e7c709d351c5c2217eee15fb5b35cb88eeacb4d08ef9f",
 				"linux/s390x": "sha256:41870b3464c99d049e071454ab46585a59173723b410a30d755be253d895e8b5"
 			}
 		},
