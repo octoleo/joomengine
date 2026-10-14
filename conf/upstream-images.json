@@ -120,7 +120,7 @@
 			}
 		},
 		"5.4.9-php8.3-apache": {
-			"index_digest": "sha256:45fa22ae3dbad751d8227fd168156409e47ef6a7da8d9fd7881853ab6ba6dd56",
+			"index_digest": "sha256:7e01c8dcbfdcbfc94da3aa719efa01894db688f43386e798c3f7e8f575d345bd",
 			"platforms": {
 				"linux/386": "sha256:7987b7802d394d0310db53c284e59baf2144a6baa9f2476b3a2f227120033ace",
 				"linux/amd64": "sha256:e883fb825beecdabd2dd7129bc18dbed9a2772b18a0eebddf53dc8956c8082ec",
@@ -128,7 +128,7 @@
 				"linux/arm/v7": "sha256:322efa3d43861fc2346fdac0bb3f4274b230db8690eafedca9d9b5037a1950b8",
 				"linux/arm64/v8": "sha256:60623c19bb8aceba1a564fd75453bc9e620e645d7fdbf85e53f812d572c8bff9",
 				"linux/ppc64le": "sha256:d7705ec7f1a92e4692c971bef6ccc1cb1e9b9d0ea388fba23fe1b41c651de9dc",
-				"linux/riscv64": "sha256:47ea03df730450a384c15aae2a9271e5579e0c4f3ab1f3c853e82ab88c7570cf",
+				"linux/riscv64": "sha256:4f99617e134ee613368504fba22eedb2cb5f0b0126276d68c03c52981ec63fe2",
 				"linux/s390x": "sha256:f003bbdd8eb0707afe972adbb7aee9437598dab52053ada6c1cbaacf051bc8a1"
 			}
 		},
@@ -159,7 +159,7 @@
 			}
 		},
 		"6.1.4-php8.3-apache": {
-			"index_digest": "sha256:855ae226abf6326abb00a4c6617cd8401cf95d71f226d77e9f4889b3073b90d3",
+			"index_digest": "sha256:af3b7c440f8802d652fa02826e07b51bdbf0170eaa501529cb14d51cf4062176",
 			"platforms": {
 				"linux/386": "sha256:363a1a4f73d5c42097596f1b67c4e0a2d0adef9e7b5880a1107138ea91906a0e",
 				"linux/amd64": "sha256:11ad7bfcd51c7faae4d4e42e8afd043cc176cd88069fe0a7737d7d54e578c12d",
@@ -167,7 +167,7 @@
 				"linux/arm/v7": "sha256:c890877d313a3254e70e5e883892b09716f8ceda1d92f29d78057d90f4811958",
 				"linux/arm64/v8": "sha256:433eb1b23226b17684c0a87ce74efec1bfe42cc6a074bff06ee13b65ad3b100b",
 				"linux/ppc64le": "sha256:d1f93f6e6c9b4e814d23a2539e1f7d3b97961f9672f1c9dd1fe8ec2fd74d5358",
-				"linux/riscv64": "sha256:2588faa85923665bd4231c9cd921d2ca85bfa3151dc6f5a10ad770d838dd5b57",
+				"linux/riscv64": "sha256:47e44ce138acee17a6d66515a9b58b4fd87cdb4167b56e772e7c5e5dd882463e",
 				"linux/s390x": "sha256:0a2349e6bb3eaa6d5d82409cba461f2ef9301aeb45922a9a8b14eba37eecf009"
 			}
 		},
