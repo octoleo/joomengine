@@ -10,6 +10,7 @@ fi
 
 image="$1"
 flavor="$2"
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 timeout_seconds="${JOOMENGINE_SMOKE_TIMEOUT_SECONDS:-900}"
 if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
     echo 'JOOMENGINE_SMOKE_TIMEOUT_SECONDS must be a positive integer.' >&2
@@ -125,6 +126,16 @@ verify_extensions() {
     assert_query 3 \
         "SELECT COUNT(*) FROM joom_extensions AS child JOIN joom_extensions AS parent ON child.package_id=parent.extension_id WHERE parent.type='package' AND parent.element='pkg_joomengine_mcp' AND (child.element='com_joomengine_mcp' OR (child.element='joomengine_mcp' AND child.folder IN ('console','webservices')));" \
         'All three MCP extensions must belong to the installed package'
+    docker exec --interactive --user www-data "$application" php \
+        < "$test_dir/mcp-worker-runtime.php"
+    local worker_probe
+    worker_probe="$(
+        printf '%s' '{"protocol":"joomengine-worker/1","operation":"job.probe"}' \
+            | docker exec --interactive --user www-data "$application" php \
+                /var/www/html/administrator/components/com_joomengine_mcp/cli/job.php
+    )"
+    jq -e '.protocol == "joomengine-worker/1" and .available == true' \
+        <<< "$worker_probe" >/dev/null || fail 'Installed MCP background worker must be available'
 }
 
 extension_snapshot() {

@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq shellcheck xmlstarlet gawk
+          sudo apt-get install -y jq shellcheck xmlstarlet gawk php-cli
 
       - name: Validate shell scripts
         shell: bash
@@ -252,6 +252,16 @@ jobs:
                 test -z "${MCP_VERSION:-}${MCP_SHA512:-}${MCP_PACKAGE:-}"
               fi
             '
+
+      - name: Exercise detached MCP workers as the service user
+        if: matrix.flavor == 'mcp'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --interactive \
+            --platform "${{ matrix.platform }}" \
+            --user www-data --entrypoint php \
+            "${{ steps.context.outputs.image }}" < tests/mcp-worker-runtime.php
 
       - name: Verify first deployment and restart against MariaDB
         if: matrix.variant == 'apache' && matrix.architecture == 'amd64'

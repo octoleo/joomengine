@@ -44,6 +44,12 @@ ENV MCP_VERSION=1.0.10
 ENV MCP_SHA512=2eeffc65c2559bc36a602c2273e474d92b0b060522f90357c3b8f368b5f68904544946ebcd809bbebf8d68ef27536179e00e093c1b5de6f4bfba3b99c210dabb
 ENV MCP_PACKAGE=https://github.com/joomengine/mcp_package/archive/refs/tags/v1.0.10.zip
 
+# JCB jobs launch a detached CLI worker. The official PHP/Joomla base does not
+# enable PCNTL; docker-php-ext-install also manages Alpine's temporary build deps.
+RUN set -eux; \
+	docker-php-ext-install -j "$(nproc)" pcntl; \
+	php -r 'foreach (["pcntl_fork", "posix_setsid", "proc_open"] as $function) { if (!function_exists($function)) { fwrite(STDERR, "Missing MCP worker function: " . $function . PHP_EOL); exit(1); } }'
+
 RUN set -eux; \
 	curl -fSL "$MCP_PACKAGE" -o "$JCB_INSTALL_DIR/mcp.zip"; \
 	echo "$MCP_SHA512  $JCB_INSTALL_DIR/mcp.zip" | sha512sum -c -; \
