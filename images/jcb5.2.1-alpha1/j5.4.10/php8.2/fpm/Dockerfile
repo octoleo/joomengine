@@ -6,7 +6,7 @@
 # -----------------------------------------------------------------------------
 # Official JCB v5.2.1-alpha1 image: extend the official Joomla! v5.4.10 image
 # -----------------------------------------------------------------------------
-FROM joomla:5.4.10-php8.2-fpm@sha256:ca053077d897f422840e4f68c21e9b35f5414485b9f6ed36297987acf39529fa
+FROM joomla:5.4.10-php8.2-fpm@sha256:87597249a6f063981032cf73d5667bfd007447731dfaeb7296a6316c19c0a9af
 
 # Metadata
 LABEL maintainer="Llewellyn van der Merwe <llewellyn.van-der-merwe@community.joomla.org> (@Llewellynvdm), Lemuel van der Merwe <lemuel.van-der-merwe@community.joomla.org> (@lemuelvdm)"
@@ -15,7 +15,7 @@ LABEL org.opencontainers.image.description="Joomla! v5.4.10 + Component Builder 
 LABEL org.opencontainers.image.version="5.2.1-alpha1"
 LABEL org.opencontainers.image.source="https://github.com/octoleo/joomengine"
 LABEL org.opencontainers.image.base.name="docker.io/library/joomla:5.4.10-php8.2-fpm"
-LABEL org.opencontainers.image.base.digest="sha256:ca053077d897f422840e4f68c21e9b35f5414485b9f6ed36297987acf39529fa"
+LABEL org.opencontainers.image.base.digest="sha256:87597249a6f063981032cf73d5667bfd007447731dfaeb7296a6316c19c0a9af"
 
 # -----------------------------------------------------------------------------
 # JCB metadata (required at build-time)
