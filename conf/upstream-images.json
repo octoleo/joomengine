@@ -42,114 +42,114 @@
 			}
 		},
 		"4.4.14-php8.2-apache": {
-			"index_digest": "sha256:d6ad73472a782d97bc22cbaf9e0c522e39cede734ee39bcd64f420fbc75f42bd",
+			"index_digest": "sha256:c6fb65313d8583e3ed19912a1b79f9f2de2c19ecce8cd599963c62a600e315df",
 			"platforms": {
 				"linux/386": "sha256:b9e7ba99eb6988af0ade0990819976b984d0e6616ba122cec8a26fcef116d2f5",
 				"linux/amd64": "sha256:f0b8a1b1f0a593a02fe799a91c84ea53917269b9e5901d1561a0c86f31dacde1",
 				"linux/arm/v7": "sha256:b9108cec0101cbc932bed0f6626ad5a93537a4bc338ce433156717b48ad7ee7b",
 				"linux/arm64/v8": "sha256:872d8401429f5237e8aad86167d70e07751db9cd4d397c3dd1bdc2a93931c7a2",
-				"linux/ppc64le": "sha256:e7338ffd87d8fe4e755bfc96010a4894ec6a3841e0080d6124e3848df2c2aac6"
+				"linux/ppc64le": "sha256:89ef626e80d7ed0de2d5338c399e69ba73d71edd64c29ceec53a89c67d6087ef"
 			}
 		},
 		"4.4.14-php8.2-fpm": {
-			"index_digest": "sha256:11a325e8fd5330d19daaca1901a2c35957702e0bbe11ded03e947d78e9373f40",
+			"index_digest": "sha256:c7a20aa9f657755b4ca2e7578f41691df63bc009ac8f4fa72485f7aa81bedee7",
 			"platforms": {
 				"linux/386": "sha256:a9f73ee71450ecde57bda7be57401d1a0025e39289836ecf52d3fb98b937299a",
 				"linux/amd64": "sha256:181d46a002e1ee481eaebad87b96fdc7498112cb9eafe9eb32478d687a60b4b8",
 				"linux/arm/v7": "sha256:012b7687fb3b08a40c4dd601dde598ad8545b1f46748a06d9bf78d5da532cf1b",
 				"linux/arm64/v8": "sha256:f75ce52c643951c781ebda005ec665bef43889848a89b9c32d87b18d5c8dc4e8",
-				"linux/ppc64le": "sha256:52843369552d355d1c2278907e1b17928c5741a52bb2eded39f75156dd717747"
+				"linux/ppc64le": "sha256:546a1c66725eaf5431ad03d12c66c230696150a13e17559e606ad50d0700c78b"
 			}
 		},
 		"4.4.14-php8.2-fpm-alpine": {
-			"index_digest": "sha256:00fd1f1d5fef9fcea505e09807893b86230ceae1c2b7ab450ab96d2e35fdefc2",
+			"index_digest": "sha256:9d750954440803df74d1b16dfbdd122cf855b2d4fd44160dbb400e4518530a6b",
 			"platforms": {
-				"linux/386": "sha256:2ccb376d939590b18cbd34625e4d1d5558cae06b9a7de43dc1c362e60bf0e537",
-				"linux/amd64": "sha256:1b87ceb83233319c6a421d435c0f9ae84f1006eb6317956a3c896b167dc80070",
-				"linux/arm/v6": "sha256:ba109b31cd7b3f572e5d8a4c98087a1b79e6ab19a68bc27074777c6cc4814832",
-				"linux/arm/v7": "sha256:e04ac709ed5b3b9dcb8ac2633f8b3c673650f0e3248a8881414a6434db10c984",
-				"linux/arm64/v8": "sha256:3e39981218885e49eca1c1e8c35ca75baf5b91c32c0370b0d2b247d30f8fd39f",
+				"linux/386": "sha256:b54f1067e2e4781324d0700d800b41639899b7ccd18270ba60cde52290324c0d",
+				"linux/amd64": "sha256:8092aba2a012ef5e7138b529ce8ddb37aaba4396e1b84d8035ce56d28c582893",
+				"linux/arm/v6": "sha256:c9ffc484369b36e7186b80df6863ddfff154210c1c6fa5703d31a7d626f0281f",
+				"linux/arm/v7": "sha256:2b132bdecb3a1493a57f99da345f4324721cf0d26b2ed68388fe109ead1cffca",
+				"linux/arm64/v8": "sha256:dea84a8e5e0e111c5bd603ac2ede35db606b4945ee1c370f2b7c9ae8942da6c4",
 				"linux/ppc64le": "sha256:2249f9602e54e719ccb6c76f649466f09fa0da60059901069b0c7b84fc5c5979",
 				"linux/riscv64": "sha256:ea1e15f711200bf6bf147a10f757a26e25e7e69ca435425d01bd459e7b9a40ab",
-				"linux/s390x": "sha256:bc6a8560b35aeef9f2bae1c13b9c0efdfcc4ddec85b5c9fd3afa55d829fc98be"
+				"linux/s390x": "sha256:0df09e2c03a4c29168b1a66c36f1e8db1059f9dec49c85ab92fe1e7f5c00b802"
 			}
 		},
 		"5.4.10-php8.2-apache": {
-			"index_digest": "sha256:4b3e2801681b4c50c211c673641b6ce853f8706cff8a1a32b6e31a847617a906",
+			"index_digest": "sha256:d4f6acf85c5597d309bbe55dea07b9019b3a7a89d334605e53d12edec38d1a24",
 			"platforms": {
 				"linux/386": "sha256:d4edbd9bf1d684098ab3cb6a2439c433edf47c92a1c37b3deeb2e930c2e99314",
 				"linux/amd64": "sha256:e12b019865686936657541b832b1589dfd47a1670efafc06ff8bfa9126acedb2",
 				"linux/arm/v5": "sha256:6037218b6a7141fa0d79dd1a938b2ea7f8fa08a992a1767066adc69bc9fff92e",
 				"linux/arm/v7": "sha256:230520d7ce161935f9f5459f09b9492076fef9b7dd1bb96f6f7a1741a77721e7",
 				"linux/arm64/v8": "sha256:024de09c29596e9d1f635b85f979d27bf957e4e20ba0be6a3a06ed7e8dd8a819",
-				"linux/ppc64le": "sha256:ca7e6e88252a1e1f87ae69102f916feef949c7136c76a3fabe1d471e6921cdda",
+				"linux/ppc64le": "sha256:51a0c5aee629f8d6411da977443122c11786e272e5b6d45db8b78c8d49019554",
 				"linux/riscv64": "sha256:7e302022e5fbe6eb932fafc75a017bdbe01b5b8c67ddc483cd109428a54f6216",
 				"linux/s390x": "sha256:2bb3d8ca0ae1cb2090fef3b132f7a2d80c628279a012e4b20b2b96e16bdb7592"
 			}
 		},
 		"5.4.10-php8.2-fpm": {
-			"index_digest": "sha256:4df6be9726056249d7524f66dcc723fe5ac3a19660dae0209110190a8da55189",
+			"index_digest": "sha256:cfe803713e8269983027f7b2b11b12a7f656c7ad3834684cd7ac44f79a642c4e",
 			"platforms": {
 				"linux/386": "sha256:1464836dfc23765f4a2a0cfadb3b59819be3c6acb07945f090d9f03dcb834b13",
 				"linux/amd64": "sha256:26477ef0c85ac5211bc069bbba6bd4a9cc21bca9705207e818d0662939f8537f",
 				"linux/arm/v5": "sha256:d5631212f7788a5864d7475f75c0c71fbe8fd41e1a69fe4122e639dbb99ae759",
 				"linux/arm/v7": "sha256:3b863f2ac669c5acfc8afffafebd7c3627f357ffd53c1143db710d4c9d46eab7",
 				"linux/arm64/v8": "sha256:212c2cea0bd806f23ed14f54fa0d6f420c78a0544c76914d34c83ada98c898c1",
-				"linux/ppc64le": "sha256:34d5d263a4358fb0e133f394484e31461e23de9fd7491fd3e135418b71db80b9",
+				"linux/ppc64le": "sha256:fb7d69d71d04b8fbc865fa4043c40ce47cc4ce3e4b54165ee49ba8ad0d0e3c9f",
 				"linux/riscv64": "sha256:880c99074994a6422f879152e5344ba16e6fd13e6d075268f133c23aced11f30",
 				"linux/s390x": "sha256:9c423ccef0af5a5899561bb2f64b9f4923e513f3ee8ab50a23a66bb6ae85c2c6"
 			}
 		},
 		"5.4.10-php8.2-fpm-alpine": {
-			"index_digest": "sha256:0d6191c346ff46def39607b5203bdb6122b4f0315eee17247969a64657f9f962",
+			"index_digest": "sha256:7195f78e8e940cbf4a7c0a2e9dfefb00fa96fa43cd1b2e231b9c650555b82f71",
 			"platforms": {
-				"linux/386": "sha256:bdb58543b0972ee78d154987f35f6364a3b027eb982fd02964d37f908e364d42",
-				"linux/amd64": "sha256:8953ac26820924cd87c51bdb49992df4e3388ea51fc32323dede98a0b82dbcab",
-				"linux/arm/v6": "sha256:8cc20a37a91b9eb3dba8cf6bafb8630ebd3dbb3daeede62f1c9f6e0d4da34dd6",
-				"linux/arm/v7": "sha256:184c09780af98eae16c48587417a1b8a05d4259e0e87e269e90b39334a16b5ef",
-				"linux/arm64/v8": "sha256:f539d03fa905f083343f8bfcb39b340a85ec20b225bc481f25abecfe8be13040",
+				"linux/386": "sha256:4c726c5e19941fe4fe6c2539f238a2d2b59c5387b557ebb75c93a5f0e984e2c4",
+				"linux/amd64": "sha256:f9f9c3f0213aa9c6a5f4bd8a580dd1ff7e817bad3a0980f243b80be0fb613ba2",
+				"linux/arm/v6": "sha256:50bde06058dee2aea6b7c64411d1d8c883127583ed416766ff9d4ee40a298693",
+				"linux/arm/v7": "sha256:8c914ac11c45e74fe10c7fd4c0d85b7bdae7cf173c8b54c4f80c172f83f81f30",
+				"linux/arm64/v8": "sha256:534bcb84bdd84a14520f35d590cb0924cdde97045f7a47617680e3182cda2104",
 				"linux/ppc64le": "sha256:36e7e9e702ec8d61d125128f39ea249389e974a67a6e27f9c081753f03741356",
 				"linux/riscv64": "sha256:81f4e59950965fb35dd27c33e39dcf7bb866cce8defb3c2766c85540175aa5f3",
-				"linux/s390x": "sha256:e4e27d06d2ef137da2a6ccece837e608b829e1f978bc185d94210b8413cf8da0"
+				"linux/s390x": "sha256:2f9e82c560d3c6233194440442f5aca7f86c7ef671067627abb6f63e712853d3"
 			}
 		},
 		"5.4.10-php8.3-apache": {
-			"index_digest": "sha256:ae1319a9b6e90b72b2208ecb954823edd3d3b8e4e193e3de57d5acd05cc46be0",
+			"index_digest": "sha256:9e7ce3a9e29490ebcd568991f8ad60340a6e5c1b0ba85ded794c31711524cc70",
 			"platforms": {
 				"linux/386": "sha256:d0de40fa409e1cb3791e678ae4ccde453d1990a8b146abe503172470c1f7f88f",
 				"linux/amd64": "sha256:10330f7ce8d2a375578beb1886edcbc520eb015e7a8c640421f70350f70e62c2",
 				"linux/arm/v5": "sha256:e907dd2cd51d3da02c33f0e0a3191dcabc6d0153d517cca205a3077b66da6bfe",
 				"linux/arm/v7": "sha256:467339d89c9a0d166912a891e63e4d97f8fde60b581f4bea9e2ca850feb3931b",
 				"linux/arm64/v8": "sha256:9fea503f1e07f0cbc3b4f4cd0affe1c0a9cacc5a4d3b35d9111f750f375080fe",
-				"linux/ppc64le": "sha256:8602f861b9691999f76debbb78527e4ef40543f214987b6324b06f2085f757bd",
+				"linux/ppc64le": "sha256:a931125adc390798e0f8b6bce6306b1eaac17ef52f92a6b9272f449f4c5bdc22",
 				"linux/riscv64": "sha256:3ec40cb07dafec768764c2387ac999f32100766f1be41ce148353b8d3e723a71",
 				"linux/s390x": "sha256:399f5e57a0121536290e71323c452d6f310107cc2ade9b3f9db45b3156c32caf"
 			}
 		},
 		"5.4.10-php8.3-fpm": {
-			"index_digest": "sha256:c7c1b902bb5693fccd55f4b35a69f626ca6256ee22ea2461c51b0b656ecfd707",
+			"index_digest": "sha256:5e66142a0672f73456c23266e3f757f39aea67af8aa00c3b528d368cb5b8f442",
 			"platforms": {
 				"linux/386": "sha256:dc91462cf603f10f224e3b01a5f3e02b9dc9bb4033ab0fa7fe7d18c484878ec4",
 				"linux/amd64": "sha256:76766d1e7a928dc1850cfb2600ddd3938539419e115b33458c92b66fb8a2fbd7",
 				"linux/arm/v5": "sha256:1bce9b09a2f54eafd5d1b710caab0a6a6743bb22fd4e33958da218a63ec53cff",
 				"linux/arm/v7": "sha256:99cbfeb7a8eff074a5aabc64b7fefd65e70bd5f476981c639e47f185ffc7db91",
 				"linux/arm64/v8": "sha256:6576bd300282c5e7bce66146c9ae4f08d7aa5d02b1e7fd0cea7ba8c9c84d152a",
-				"linux/ppc64le": "sha256:ee875a080a9b7becfba863dec3167b705dada62b0a2d84112301c4d61d219b4d",
+				"linux/ppc64le": "sha256:313f1d14ae5de9c99bebc4bb23893ecfaba38c21e45cf837ada151769606ac65",
 				"linux/riscv64": "sha256:ce4e7b5e586aed71408f22dff1d3fc9e6142767b3dbad8736fa9c2e5cd5e3e3d",
 				"linux/s390x": "sha256:f28cc4c81589e08c6d694cb07d5e1f36da351d918cb31e19aaf065629e6f3f80"
 			}
 		},
 		"5.4.10-php8.3-fpm-alpine": {
-			"index_digest": "sha256:6d0c9badc3078e6dfff2baa3e015fa1551eec80c72277b0eccde11a1c744ea21",
+			"index_digest": "sha256:b4c9cb3abd4a4099e7e5feb8a38416fcb903fa62ddd426c47804807e07434832",
 			"platforms": {
-				"linux/386": "sha256:09b2407901fda2e3893ab62cc36ddffef1f3693901a412c0645b13c804d13d48",
-				"linux/amd64": "sha256:341a7f18f8709dcc6350ff83d986997c332e7a6bdb5b6d49805d654d37e27d06",
-				"linux/arm/v6": "sha256:668fb500f859d6e6734afd855462bac612f40463973b9f65c8a1ea71e9758e55",
-				"linux/arm/v7": "sha256:6381ee2d3e0a34930bac6c345b9756b6abd84248aa510f2e0a37805bbcfe42db",
-				"linux/arm64/v8": "sha256:85e91261cbbd871585a673ac98be05a2e785d4f7b7a1d5e4de7f0a9fbf20db9a",
+				"linux/386": "sha256:2ed22772309a83784f1ca818ec2b607e1822ae73e28a69c64ece366e1fadc31c",
+				"linux/amd64": "sha256:873209ca4a98dd5b8ece1fa04e351c62dd34111f88b9bea233da1a9cfb5f628a",
+				"linux/arm/v6": "sha256:412916fda770c4cc22bc43de77bcd4bb57de265da46f6c213aa77efeae851970",
+				"linux/arm/v7": "sha256:55b34f4020e8c1fed3c1133741a940927af524f1b16f4609bbbcad9ba88364fd",
+				"linux/arm64/v8": "sha256:a57a84363ae95c81c3d009700dbde75c1667924465a061927c5b78f21d6db9b8",
 				"linux/ppc64le": "sha256:0daba21c91b86dfecc8e5ad9a22902e791ffa7fa67303a950f43db4f70f26d92",
 				"linux/riscv64": "sha256:22e9878e5deb35a7c283f670e4733f09555ee93eec2d3bc3984411959afc3989",
-				"linux/s390x": "sha256:47871c4518bcd1422749fb75f100457834ed0be296538ae9c1d4175877ae0313"
+				"linux/s390x": "sha256:23793e88705c32d3378e3815a78ef16d6dfa0c6f454cae2487bf5913d8cbe9d0"
 			}
 		},
 		"6.2.0-php8.3-apache": {
@@ -179,55 +179,55 @@
 			}
 		},
 		"6.2.0-php8.3-fpm-alpine": {
-			"index_digest": "sha256:868c0738ffe1e6091b35a229722ed2394b63cf8acf4db5849b7f5c46f967c416",
+			"index_digest": "sha256:418ae310541a81ae7b9a2b7963f37fe4603cc1269246841ddca382e98361a32e",
 			"platforms": {
-				"linux/386": "sha256:9150a9f877efd478b7ca0d6ebfb2d1fd6608f9134e47217727408e7b7bb8ef3d",
-				"linux/amd64": "sha256:3117df1ff155f388b233a9996924343da3ca180e3f4bf15003ffd57def806d33",
-				"linux/arm/v6": "sha256:1d7a4c2a3c792862a0b94b44cc101834f4b85449bb3f4bacdd7b303c8e257b77",
-				"linux/arm/v7": "sha256:a03b4122bd9f1d722eb8101e0da43de8eabc5fba27c592ea426ac2e45f14bee3",
-				"linux/arm64/v8": "sha256:24cb56c63729ee2e211584ee8e19fd9d50755315e32a7bf7588280e19b5df2c4",
+				"linux/386": "sha256:574e6fda4394e348bf23e4c2f05e5f37a2c6fb611637a59362a2420331b86fc1",
+				"linux/amd64": "sha256:e68e28bca39220427ea0b8bf96edc9b65598a4d8d4d126cb5998b64d9480be74",
+				"linux/arm/v6": "sha256:a5fc74866614c9c9964f3c05aa31e7fdb636eeb76cbf7db5d834c905016e78e2",
+				"linux/arm/v7": "sha256:4d68c235b3020b7585d4547ef2304df37fca687b22f1cf7c7aad46b9c62abcfc",
+				"linux/arm64/v8": "sha256:21377439f2304fc28029720f987c449978a40c547b056ac854020619de4b9108",
 				"linux/ppc64le": "sha256:6af5bca133b430025c799ebed8e558cc42b6113b1071697194991836d0240c1e",
 				"linux/riscv64": "sha256:1fd5ffde571d3eb9a2291b9fddefb738a409ee738bcfeb25a703853c77c6932b",
-				"linux/s390x": "sha256:7841d114edb977dd1ef5cd393e38bb35d77a54262a6332319b9b8011f72f072f"
+				"linux/s390x": "sha256:712a97783f239685166cac951033e4ac77f963412850e4c201a6c9b2744c19d3"
 			}
 		},
 		"6.2.0-php8.4-apache": {
-			"index_digest": "sha256:317c4111354cb8a5a6befa3cdd9f7bd5e0e7947eb326086a33e2ba06026816b3",
+			"index_digest": "sha256:5fb4c9b832aa021cffcfea51919c7fe9852403a7469e13094844e18cfdb751ff",
 			"platforms": {
 				"linux/386": "sha256:6103460841643205cc22f2cbd180047e1fd61262835f2cb04d1dd9a4693104c1",
 				"linux/amd64": "sha256:717d948bf220ff07984d840a09b2108ad2806a1ba9cb76ce0570cfa0db539229",
 				"linux/arm/v5": "sha256:9996e25427f4987eea1b07840fdeebcc99ad8f78235edd3189e8b7ad07c3b805",
 				"linux/arm/v7": "sha256:82685011866b8d3d109fd36edb75baa1e67b59450104857a4008e6eb66d7cf85",
 				"linux/arm64/v8": "sha256:922f9a6b65fdc747c1dd2d4f8672f8f9b94bb5c49fc7e22d072e4df248779b59",
-				"linux/ppc64le": "sha256:35b616c78f3c592bd7fdebd772fd155e09de8a4bfeae8d540d5a5f4c6e8e8dc0",
+				"linux/ppc64le": "sha256:4760cc0d339bfb6b212f336e26e854fbbc9a9d19645347bc4057e90490d30a60",
 				"linux/riscv64": "sha256:475a159319d8cfc69d46b157643835b795775a6ce7af405a2986d210959bc5b0",
 				"linux/s390x": "sha256:d6cc4e048f68bb57bb290772b15a2e79658f03ef5e3cd2d04e65e2719a74ee49"
 			}
 		},
 		"6.2.0-php8.4-fpm": {
-			"index_digest": "sha256:fc2759a577cd776ceee65534d18231ef34a833d6b869fb8cb70e2adbb45455f0",
+			"index_digest": "sha256:7121314e51a9b39ebc42c6c418d682cbe409ef63ce5ac733a5305116b0efe228",
 			"platforms": {
 				"linux/386": "sha256:6a41a42e28687ae2128691bd5a7c98a1561ecdadd2b801b867d4334a6c87ab1f",
 				"linux/amd64": "sha256:7dd3ccdfcc97fd3b74f6f60541c7a5e41b530f4f2412a60f034151c7624d7182",
 				"linux/arm/v5": "sha256:505219cd7b1de5b511f8ee9ee6e4d0d740548048717213ba5c8664130cd82a4e",
 				"linux/arm/v7": "sha256:b107307ac9108747dca1242417a50865dd5e05e9c1bb2ff73e56615d107e1295",
 				"linux/arm64/v8": "sha256:3f60ac4fe9cf14ea774ac6022f7c334941e84de09a112e211eae3a61499989be",
-				"linux/ppc64le": "sha256:ae017c96eb5ecb67fbcd6d8b6153a7aedac0ccfd87533f3dd7a4127eab20fb2d",
+				"linux/ppc64le": "sha256:ff0ae1905d896d6837cf87b9ac97c504a51d0c0c4ab5ef73460727945b80546e",
 				"linux/riscv64": "sha256:f914d2e467dff0bdbf4d91aca52c9bf9bf18c15e7e88d0c1305aba8aa2e928ca",
 				"linux/s390x": "sha256:597b457acb45f0ca42d957f0a05defec3870bdda9d2c303d422a0207a0e20f53"
 			}
 		},
 		"6.2.0-php8.4-fpm-alpine": {
-			"index_digest": "sha256:bc8138249fd3e24c79b522976947d2c63a9fb00acba5796384910d81e747f786",
+			"index_digest": "sha256:8a81aeb91a4972653a8cec10c09c26354a19037ac07d27b849eddb2c1e715dcc",
 			"platforms": {
-				"linux/386": "sha256:08e02ff614ebcce66e15d9b7a82df29ba5aa6ee141c9638e0b5c126d366aab3b",
-				"linux/amd64": "sha256:06136c0b42dfbe26c275aa75b713bbc69bfaa4bbaedc8b5c3f9dcfbe245798c8",
-				"linux/arm/v6": "sha256:14236dabccd763d76d7de5fdc03fe25566da3a1a9c8817329ed5e4139a05199a",
-				"linux/arm/v7": "sha256:5c901c8a560be5d2f86d266cdd29353a0807db44eabb8a3db39742d1a7223752",
-				"linux/arm64/v8": "sha256:848f3570516a0bdc20e8161f9daac987210420f91d58fff55b15334fc7899247",
+				"linux/386": "sha256:bbcd3b50b41a3131b6b77b7d24bf3cd201806f1870e78a54abd9dc5af9ed1a4d",
+				"linux/amd64": "sha256:c988e1d369152886fbca9c7fce43c576c49bb5c1d4faa9e30ba20c42a0856aaa",
+				"linux/arm/v6": "sha256:104afb4ff3fc3e438ffabe7cd4071629ccc67e173a55c4a356e5f74c60643686",
+				"linux/arm/v7": "sha256:ac50a9c9fab30e7beb3685d92b164a9995590bc7b3566232baaa7eba7e186fd3",
+				"linux/arm64/v8": "sha256:64776ca8ad999cce9993456882618451667a166713959867e5e03ead77c6d3ff",
 				"linux/ppc64le": "sha256:2e8bc40b882286783021ceab6e5c93607d1aeed91b222f10b113d897aa8cb30f",
 				"linux/riscv64": "sha256:9b20556b00e4ee807c940ef71e88590322faa39d4d6be76fc9ffca2da4bbdb28",
-				"linux/s390x": "sha256:c07970cb5dd89b43db224a82b4dde508a485b51b4459c047d7a9cded0c401c01"
+				"linux/s390x": "sha256:60e8afae24e6708d1315633c16b9d895d8acd628dc45ac70deb06981727a4b4c"
 			}
 		}
 	}
