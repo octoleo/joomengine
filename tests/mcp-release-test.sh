@@ -58,7 +58,8 @@ write_hashes() {
 		([.version, .php, .joomla, .variant, .jcb_sha, .release_input_sha,
 			.build_input_sha, .base_index_digest, .base_platform_state_sha,
 			(.platforms | join(",")), .flavor, .mcp_input_sha] +
-			(if $record | has("profile") then [$record.profile] else [] end)) | join(" ")' \
+			(if ($record | has("profile")) or ($record | has("target")) then [$record.profile // "standard"] else [] end) +
+			(if $record | has("target") then [$record.target] else [] end)) | join(" ")' \
 		"$TEST_TMP/manifest.ndjson" > "$TEST_TMP/hashes.txt"
 }
 
@@ -71,6 +72,29 @@ enable_dev_profiles() {
 	jq '."6".profiles = ["standard", "dev"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
 	mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
 	rewrite_manifest '.profile = "standard" | ., (select(.major == "6") | .profile = "dev")'
+	write_hashes
+}
+
+reset_named_targets() {
+	reset_case
+	write_xml 1.0.1 8.3.0 '(6|7)\.'
+	local package
+	package="$(mcp_resolve_package "$TEST_TMP/update.xml")"
+	jq '{
+		"stable6": (."6" + {jcb:{major:"6",versions:"latest-stable"}}),
+		"preview7": (."6" + {
+			joomla:"7.0.0-alpha1",channel:"alpha",update:"pinned",tags:"qualified",
+			jcb:{major:"6",versions:"latest-alpha"}
+		})
+	}' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+	mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+	jq -c --argjson package "$package" '
+		select(.major == "6") | .profile = "standard" |
+		if .flavor == "mcp" then .mcp = $package else . end |
+		(. + {target:"stable6",joomla_channel:"stable",tag_policy:"default"}),
+		(. + {target:"preview7",joomla:"7.0.0-alpha1",joomla_channel:"alpha",tag_policy:"qualified",version:"6.2.1-alpha2"})
+	' "$TEST_TMP/manifest.ndjson" > "$TEST_TMP/manifest.next"
+	mv "$TEST_TMP/manifest.next" "$TEST_TMP/manifest.ndjson"
 	write_hashes
 }
 
@@ -126,6 +150,74 @@ jq '."6".profiles = ["standard"]' "$TEST_TMP/versions.json" > "$TEST_TMP/version
 mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
 rewrite_manifest 'if .flavor == "mcp" and .profile == "dev" then .mcp.version = "0.9.0" else . end'
 assert_changed no 'removed profiles do not trigger repeated publishing from obsolete manifest rows'
+
+reset_named_targets
+assert_changed no 'named Joomla targets can share a JCB major without duplicate MCP matches'
+
+reset_named_targets
+rewrite_manifest 'select(.flavor != "mcp" or .target != "preview7")'
+assert_changed yes 'a configured preview target requires its own MCP counterparts'
+
+reset_named_targets
+awk '$14 != "preview7"' "$TEST_TMP/hashes.txt" > "$TEST_TMP/hashes.next"
+mv "$TEST_TMP/hashes.next" "$TEST_TMP/hashes.txt"
+assert_changed yes 'target-specific manifests require target-specific published fingerprints'
+
+reset_named_targets
+jq '.preview7 |= (.joomla = "6.1.3" | .channel = "stable" | .jcb.versions = "latest-stable")' \
+	"$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+rewrite_manifest 'if .target == "preview7" then .joomla = "6.1.3" | .version = "6.1.0" | .joomla_channel = "stable" else . end'
+write_hashes
+assert_changed no 'distinct targets with identical Joomla and JCB versions remain independent'
+rewrite_manifest 'select(.flavor != "mcp" or .target != "preview7")'
+assert_changed yes 'another target cannot satisfy an otherwise identical missing MCP image'
+
+reset_named_targets
+jq '.preview7.enabled = false' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+rewrite_manifest 'select(.flavor != "mcp" or .target != "preview7")'
+assert_changed no 'disabled targets do not request MCP publication'
+
+reset_named_targets
+rewrite_manifest '., (select(.target == "preview7" and .flavor == "standard") | .version = "6.2.1-alpha1")'
+assert_changed no 'latest-alpha excludes older JCB alpha releases from its expected matrix'
+
+reset_named_targets
+rewrite_manifest '., (select(.target == "preview7" and .flavor == "standard") | .version = "6.2.1-alpha10")'
+assert_changed yes 'latest-alpha selects prerelease numbers numerically'
+
+reset_named_targets
+rewrite_manifest 'if .target == "preview7" then .version = "6.2.1-alpha" else . end'
+write_hashes
+rewrite_manifest '., (select(.target == "preview7" and .flavor == "standard") | .version = "6.2.1-alpha99")'
+assert_changed no 'unnumbered JCB prereleases retain their established channel leadership'
+
+reset_named_targets
+jq '.preview7.jcb.versions = ["6.2.1-alpha2"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+rewrite_manifest '., (select(.target == "preview7" and .flavor == "standard") | .version = "6.2.1-alpha10")'
+assert_changed no 'explicit JCB selections ignore unselected releases'
+jq '.preview7.jcb.versions = ["6.2.1-alpha3"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+assert_changed yes 'an explicitly selected unpublished JCB release requests a build'
+
+reset_named_targets
+jq '.preview7.jcb.versions = "latest-rc"' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+assert_changed yes 'a channel with no known release requests validation by the builder'
+
+reset_named_targets
+write_xml
+assert_changed yes 'current package metadata changes still update eligible stable targets'
+rewrite_manifest 'if .target == "stable6" and .flavor == "mcp" then .mcp.target_platform = "6\\.[1-9][0-9]*" else . end'
+# Recompute exact resolved metadata: XML constraints are part of its fingerprint.
+package="$(mcp_resolve_package "$TEST_TMP/update.xml")"
+jq -c --argjson package "$package" 'if .target == "stable6" and .flavor == "mcp" then .mcp = $package else . end' \
+	"$TEST_TMP/manifest.ndjson" > "$TEST_TMP/manifest.next"
+mv "$TEST_TMP/manifest.next" "$TEST_TMP/manifest.ndjson"
+write_hashes
+assert_changed no 'Joomla 6-only MCP metadata does not enable a Joomla 7 preview target'
 
 reset_case
 rewrite_manifest 'select(.flavor != "mcp" or .php != "8.4" or .variant != "fpm")'

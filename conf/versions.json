@@ -1,20 +1,35 @@
 {
 	"4": {
-		"profiles": ["standard"],
-		"php": ["8.1", "8.2"],
+		"enabled": true,
 		"joomla": "4.4.14",
-		"variants": ["fpm-alpine", "fpm", "apache"]
+		"channel": "stable",
+		"update": "stable",
+		"tags": "default",
+		"jcb": {"major":"4","versions":"all"},
+		"php": ["8.1","8.2"],
+		"variants": ["fpm-alpine","fpm","apache"],
+		"profiles": ["standard"]
 	},
 	"5": {
-		"profiles": ["standard"],
-		"php": ["8.2", "8.3"],
+		"enabled": true,
 		"joomla": "5.4.10",
-		"variants": ["fpm-alpine", "fpm", "apache"]
+		"channel": "stable",
+		"update": "stable",
+		"tags": "default",
+		"jcb": {"major":"5","versions":"all"},
+		"php": ["8.2","8.3"],
+		"variants": ["fpm-alpine","fpm","apache"],
+		"profiles": ["standard"]
 	},
 	"6": {
-		"profiles": ["standard", "dev"],
-		"php": ["8.3", "8.4"],
+		"enabled": true,
 		"joomla": "6.2.0",
-		"variants": ["fpm-alpine", "fpm", "apache"]
+		"channel": "stable",
+		"update": "stable",
+		"tags": "default",
+		"jcb": {"major":"6","versions":"all"},
+		"php": ["8.3","8.4","8.5"],
+		"variants": ["fpm-alpine","fpm","apache"],
+		"profiles": ["standard","dev"]
 	}
 }

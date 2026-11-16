@@ -266,6 +266,24 @@ test_registry_sources_follow_build_configuration() {
 	assert_output "$case_dir" 'versions_changed=no'
 }
 
+test_pinned_preview_does_not_request_stable_feed() {
+	local case_dir preview_tag
+	case_dir="$(prepare_case pinned-preview-registry)"
+	preview_tag=7.0.0-alpha1-php8.3-apache-dev
+	jq '{"joomla7-alpha": .["joomla7-alpha"]}' "$FIXTURES/versions-targets.json" \
+		> "$case_dir/versions.json"
+	rm "$case_dir/upstream-images.json"
+	cp "$FIXTURES/registry-index.json" "$case_dir/registry/$preview_tag.json"
+	# No release file and no --refresh-current: the pin itself must bypass polling.
+	run_detector "$case_dir"
+	assert_json_value "$case_dir/upstream-images.json" '.tags | keys | join(",")' "$preview_tag"
+	assert_output "$case_dir" 'versions_changed=no'
+	assert_output "$case_dir" 'updated_targets='
+	[[ "$(wc -l < "$case_dir/registry/requests.log")" == "2" ]] || fail "pinned preview fetched unrelated upstream data"
+	grep -Fqx "https://registry-1.docker.io/v2/library/joomla/manifests/$preview_tag" \
+		"$case_dir/registry/requests.log" || fail "pinned preview did not verify its exact registry tag"
+}
+
 test_registry_index_types_and_attestations
 echo "ok - OCI indexes and Docker lists are byte-verified, attestation-filtered, and stable"
 test_registry_platform_variants_match_builder_names
@@ -284,3 +302,5 @@ test_registry_profiles_keep_distinct_verified_indexes
 echo "ok - standard and dev indexes retain distinct byte-verified digests and platform records"
 test_registry_sources_follow_build_configuration
 echo "ok - build configuration controls the release feed, registry repository, token scope and state identity"
+test_pinned_preview_does_not_request_stable_feed
+echo "ok - a pinned preview verifies its exact image without requesting the stable feed"

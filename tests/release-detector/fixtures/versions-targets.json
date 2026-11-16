@@ -1,0 +1,57 @@
+{
+	"joomla6-stable": {
+		"enabled": true,
+		"joomla": "6.1.3",
+		"channel": "stable",
+		"update": "stable",
+		"tags": "default",
+		"jcb": {"major": "6", "versions": "latest-stable"},
+		"php": ["8.3"],
+		"variants": ["apache"],
+		"profiles": ["standard", "dev"]
+	},
+	"joomla6-pinned": {
+		"enabled": true,
+		"joomla": "6.1.3",
+		"channel": "stable",
+		"update": "pinned",
+		"tags": "qualified",
+		"jcb": {"major": "6", "versions": ["6.2.0"]},
+		"php": ["8.3"],
+		"variants": ["apache"],
+		"profiles": ["standard", "dev"]
+	},
+	"joomla7-alpha": {
+		"enabled": true,
+		"joomla": "7.0.0-alpha1",
+		"channel": "alpha",
+		"update": "pinned",
+		"tags": "qualified",
+		"jcb": {"major": "6", "versions": ["6.2.0"]},
+		"php": ["8.3"],
+		"variants": ["apache"],
+		"profiles": ["dev"]
+	},
+	"joomla6-beta": {
+		"enabled": true,
+		"joomla": "6.2.0-beta1",
+		"channel": "beta",
+		"update": "pinned",
+		"tags": "qualified",
+		"jcb": {"major": "6", "versions": ["6.2.0"]},
+		"php": ["8.3"],
+		"variants": ["apache"],
+		"profiles": ["dev"]
+	},
+	"joomla6-rc": {
+		"enabled": true,
+		"joomla": "6.2.0-rc1",
+		"channel": "rc",
+		"update": "pinned",
+		"tags": "qualified",
+		"jcb": {"major": "6", "versions": ["6.2.0"]},
+		"php": ["8.3"],
+		"variants": ["apache"],
+		"profiles": ["dev"]
+	}
+}

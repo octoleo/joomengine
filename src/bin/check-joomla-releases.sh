@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Poll Joomla's stable-release feed and verify the published Docker registry
-# indexes before advancing base versions or refreshing their digest state.
+# Poll stable Joomla targets and refresh pinned targets from the published
+# Docker registry. Preview targets never follow the stable-release feed.
 
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
@@ -44,6 +44,8 @@ The Docker fixture format is the Docker Hub list response shape: a top-level
 Live verification reads and hashes the published Docker registry index. Its
 runnable Linux descriptors determine the available platforms; official-images
 architecture declarations can include platforms that are not yet published.
+Targets following stable updates use their Joomla major, independently of the
+selected JCB major. Pinned targets only refresh their exact image digests.
 
 Exit behavior:
   0  Successful update, no update, or a release whose Docker matrix is pending
@@ -134,7 +136,7 @@ for command_name in awk jq sort realpath mktemp cmp chmod mv sha256sum; do
 	command -v "$command_name" >/dev/null 2>&1 || fail "Missing required command: $command_name"
 done
 
-if [[ ( "$REFRESH_CURRENT" == "no" && -z "$RELEASES_FILE" ) || -z "$DOCKER_TAGS_FILE" ]]; then
+if [[ -z "$DOCKER_TAGS_FILE" ]]; then
 	command -v curl >/dev/null 2>&1 || fail "Missing required command: curl"
 fi
 
@@ -187,38 +189,25 @@ if [[ -n "$OFFICIAL_IMAGES_FILE" ]]; then
 	[[ -r "$OFFICIAL_IMAGES_FILE" ]] || fail "Official-images file is not readable: $OFFICIAL_IMAGES_FILE"
 fi
 
-if ! jq -e --slurpfile config "$CONFIG_FILE" '
-	type == "object" and
-	length > 0 and
-	all(
-		to_entries[];
-		.key as $major |
-		($major | test("^[0-9]+$")) and
-		(.value | type == "object") and
-		(.value.php |
-			type == "array" and
-			length > 0 and
-			all(.[]; type == "string" and test("^[0-9]+\\.[0-9]+$"))) and
-		(.value.joomla |
-			type == "string" and
-			test("^" + $major + "\\.[0-9]+\\.[0-9]+$")) and
-		(.value.variants |
-			type == "array" and
-			length > 0 and
-			all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))) and
-		(.value | (if has("profiles") then .profiles else ["standard"] end) |
-			type == "array" and
-			length > 0 and
-			length == (unique | length) and
-			all(.[]; type == "string" and (. as $profile | $config[0].profiles | has($profile))))
-	)
-' "$VERSIONS_FILE" >/dev/null; then
+# shellcheck source=../lib/build-targets.sh
+source "$REPO_ROOT/src/lib/build-targets.sh"
+if ! TARGETS_JSON="$(build_targets_normalize "$VERSIONS_FILE" "$CONFIG_FILE")"; then
 	fail "Invalid Joomla build matrix: $VERSIONS_FILE"
+fi
+NEED_STABLE_RELEASES="no"
+if [[ "$REFRESH_CURRENT" == "no" ]] && jq -e 'any(.[]; .update == "stable")' <<< "$TARGETS_JSON" >/dev/null; then
+	NEED_STABLE_RELEASES="yes"
+	if [[ -z "$RELEASES_FILE" ]]; then
+		command -v curl >/dev/null 2>&1 || fail "Missing required command: curl"
+	fi
 fi
 
 if [[ -f "$STATE_FILE" ]] && ! jq -e --arg repository "$JOOMLA_REPOSITORY" '
 	def digest:
 		type == "string" and test("^sha256:[a-f0-9]{64}$");
+	def image_tag:
+		type == "string" and
+		test("^[0-9]+\\.[0-9]+\\.[0-9]+(-(alpha|beta|rc)[1-9][0-9]*)?-php[0-9]+\\.[0-9]+-[a-z0-9][a-z0-9._-]*$");
 	def platform:
 		type == "string" and
 		(split("/") as $parts |
@@ -243,13 +232,13 @@ if [[ -f "$STATE_FILE" ]] && ! jq -e --arg repository "$JOOMLA_REPOSITORY" '
 	(if .schema == 1 then
 		all(
 			.tags | to_entries[];
-			(.key | test("^[0-9]+\\.[0-9]+\\.[0-9]+-php[0-9]+\\.[0-9]+-[a-z0-9][a-z0-9._-]*$")) and
+			(.key | image_tag) and
 			(.value | digest)
 		)
 	elif .schema == 2 then
 		all(
 			.tags | to_entries[];
-			(.key | test("^[0-9]+\\.[0-9]+\\.[0-9]+-php[0-9]+\\.[0-9]+-[a-z0-9][a-z0-9._-]*$")) and
+			(.key | image_tag) and
 			(.value | type == "object") and
 			(.value | keys | sort) == ["index_digest", "platforms"] and
 			(.value.index_digest | digest) and
@@ -286,7 +275,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "$REFRESH_CURRENT" == "yes" ]]; then
+if [[ "$NEED_STABLE_RELEASES" == "no" ]]; then
 	RELEASES_SOURCE=""
 elif [[ -n "$RELEASES_FILE" ]]; then
 	RELEASES_SOURCE="$RELEASES_FILE"
@@ -312,7 +301,7 @@ else
 	RELEASES_SOURCE="$RELEASES_TMP"
 fi
 
-if [[ "$REFRESH_CURRENT" == "no" ]] && ! jq -e '
+if [[ "$NEED_STABLE_RELEASES" == "yes" ]] && ! jq -e '
 	type == "object" and
 	(.branches | type == "array" and length > 0) and
 	all(
@@ -646,20 +635,25 @@ join_with_commas() {
 	printf '%s' "$*"
 }
 
-mapfile -t MAJORS < <(jq -r 'keys[]' "$VERSIONS_FILE" | sort -V)
+mapfile -t TARGETS < <(jq -r 'keys[]' <<< "$TARGETS_JSON" | sort -V)
 
-declare -A NEW_VERSION_BY_MAJOR=()
+declare -A NEW_VERSION_BY_TARGET=()
 declare -A DESIRED_RECORD_BY_TAG=()
+declare -A VERIFIED_RECORD_BY_TAG=()
+declare -A UPDATED_MAJOR_SEEN=()
 declare -A WAITING_MAJOR_SEEN=()
+declare -a UPDATED_TARGETS=()
+declare -a WAITING_TARGETS=()
 declare -a UPDATED_MAJORS=()
 declare -a WAITING_MAJORS=()
 declare -a COLLECTED_TAGS=()
 declare -a COLLECTED_RECORDS=()
 
 COLLECTION_READY="yes"
-mark_major_waiting() {
-	local major="$1"
+mark_target_waiting() {
+	local target="$1" major="$2"
 
+	WAITING_TARGETS+=("$target")
 	if [[ -z "${WAITING_MAJOR_SEEN[$major]:-}" ]]; then
 		WAITING_MAJOR_SEEN["$major"]=1
 		WAITING_MAJORS+=("$major")
@@ -667,7 +661,7 @@ mark_major_waiting() {
 }
 
 collect_matrix_records() {
-	local major="$1"
+	local target="$1"
 	local version="$2"
 	local role="$3"
 	local php_version
@@ -685,9 +679,9 @@ collect_matrix_records() {
 	COLLECTED_RECORDS=()
 	COLLECTION_READY="yes"
 
-	mapfile -t php_versions < <(jq -r --arg major "$major" '.[$major].php[]' "$VERSIONS_FILE")
-	mapfile -t variants < <(jq -r --arg major "$major" '.[$major].variants[]' "$VERSIONS_FILE")
-	mapfile -t profiles < <(jq -r --arg major "$major" '(.[$major].profiles // ["standard"])[]' "$VERSIONS_FILE")
+	mapfile -t php_versions < <(jq -r --arg target "$target" '.[$target].php[]' <<< "$TARGETS_JSON")
+	mapfile -t variants < <(jq -r --arg target "$target" '.[$target].variants[]' <<< "$TARGETS_JSON")
+	mapfile -t profiles < <(jq -r --arg target "$target" '.[$target].profiles[]' <<< "$TARGETS_JSON")
 
 	for php_version in "${php_versions[@]}"; do
 		for variant in "${variants[@]}"; do
@@ -695,8 +689,10 @@ collect_matrix_records() {
 				profile_suffix="$(jq -r --arg profile "$profile" '.profiles[$profile].suffix' "$CONFIG_FILE")"
 				tag="${version}-php${php_version}-${variant}${profile_suffix}"
 
-				if record="$(docker_tag_record "$tag")"; then
-					:
+				if [[ -n "${VERIFIED_RECORD_BY_TAG[$tag]:-}" ]]; then
+					record="${VERIFIED_RECORD_BY_TAG[$tag]}"
+				elif record="$(docker_tag_record "$tag")"; then
+					VERIFIED_RECORD_BY_TAG["$tag"]="$record"
 				else
 					tag_status=$?
 					if [[ "$tag_status" -ne 1 ]]; then
@@ -709,13 +705,13 @@ collect_matrix_records() {
 						return 2
 					fi
 
-					log "Joomla $major: waiting for official Docker tag $JOOMLA_BASE_IMAGE:$tag"
+					log "Target $target: waiting for official Docker tag $JOOMLA_BASE_IMAGE:$tag"
 					return 0
 				fi
 
 				COLLECTED_TAGS+=("$tag")
 				COLLECTED_RECORDS+=("$record")
-				log "Joomla $major: Docker tag ready on $(jq -r '.platforms | length' <<< "$record") platforms: $JOOMLA_BASE_IMAGE:$tag"
+				log "Target $target: Docker tag ready on $(jq -r '.platforms | length' <<< "$record") platforms: $JOOMLA_BASE_IMAGE:$tag"
 			done
 		done
 	done
@@ -733,11 +729,13 @@ if [[ -z "$DOCKER_TAGS_FILE" ]]; then
 	initialize_registry
 fi
 
-for major in "${MAJORS[@]}"; do
-	current_version="$(jq -r --arg major "$major" '.[$major].joomla' "$VERSIONS_FILE")"
+for target in "${TARGETS[@]}"; do
+	current_version="$(jq -r --arg target "$target" '.[$target].joomla' <<< "$TARGETS_JSON")"
+	update_policy="$(jq -r --arg target "$target" '.[$target].update' <<< "$TARGETS_JSON")"
+	major="${current_version%%.*}"
 	candidate_version=""
-	if [[ "$REFRESH_CURRENT" == "yes" ]]; then
-		log "Joomla $major: refreshing configured version $current_version"
+	if [[ "$REFRESH_CURRENT" == "yes" || "$update_policy" == "pinned" ]]; then
+		log "Target $target: refreshing configured version $current_version"
 	else
 		release_count="$(
 			jq -r --arg branch "Joomla! $major" \
@@ -772,43 +770,48 @@ for major in "${MAJORS[@]}"; do
 
 	fi
 
-	if ! collect_matrix_records "$major" "$current_version" "current"; then
-		fail "Unable to verify the current Joomla $major Docker image matrix"
+	if ! collect_matrix_records "$target" "$current_version" "current"; then
+		fail "Unable to verify the current Docker image matrix for target $target (Joomla $current_version)"
 	fi
 	current_tags=("${COLLECTED_TAGS[@]}")
-	add_collected_records
+	current_records=("${COLLECTED_RECORDS[@]}")
 
 	if [[ -n "$candidate_version" ]]; then
-		if ! collect_matrix_records "$major" "$candidate_version" "candidate"; then
-			fail "Unable to verify the candidate Joomla $major Docker image matrix"
+		if ! collect_matrix_records "$target" "$candidate_version" "candidate"; then
+			fail "Unable to verify the candidate Docker image matrix for target $target (Joomla $candidate_version)"
 		fi
 
 		if [[ "$COLLECTION_READY" == "yes" ]]; then
-			for tag in "${current_tags[@]}"; do
-				unset 'DESIRED_RECORD_BY_TAG[$tag]'
-			done
-			add_collected_records
-			NEW_VERSION_BY_MAJOR["$major"]="$candidate_version"
-			UPDATED_MAJORS+=("$major")
-			log "Joomla $major: ready to advance $current_version -> $candidate_version"
+			NEW_VERSION_BY_TARGET["$target"]="$candidate_version"
+			UPDATED_TARGETS+=("$target")
+			if [[ -z "${UPDATED_MAJOR_SEEN[$major]:-}" ]]; then
+				UPDATED_MAJOR_SEEN["$major"]=1
+				UPDATED_MAJORS+=("$major")
+			fi
+			log "Target $target: ready to advance Joomla $current_version -> $candidate_version"
 		else
-			mark_major_waiting "$major"
+			mark_target_waiting "$target" "$major"
+			COLLECTED_TAGS=("${current_tags[@]}")
+			COLLECTED_RECORDS=("${current_records[@]}")
 		fi
 	fi
+	# Union the final selection for each target. A different pinned target may
+	# still require the old base after this target advances to a newer release.
+	add_collected_records
 done
 
 VERSIONS_CHANGED="no"
 DIGESTS_CHANGED="no"
 
-if [[ "${#UPDATED_MAJORS[@]}" -gt 0 ]]; then
+if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
 	updates_json='{}'
-	for major in "${UPDATED_MAJORS[@]}"; do
+	for target in "${UPDATED_TARGETS[@]}"; do
 		updates_json="$(
 			jq -cn \
 				--argjson current "$updates_json" \
-				--arg major "$major" \
-				--arg version "${NEW_VERSION_BY_MAJOR[$major]}" \
-				'$current + {($major): $version}'
+				--arg target "$target" \
+				--arg version "${NEW_VERSION_BY_TARGET[$target]}" \
+				'$current + {($target): $version}'
 		)"
 	done
 
@@ -898,7 +901,7 @@ fi
 if [[ "$VERSIONS_CHANGED" == "yes" ]]; then
 	mv -f -- "$OUTPUT_TMP" "$VERSIONS_FILE"
 	OUTPUT_TMP=""
-	log "Updated Joomla base versions for majors: $(join_with_commas "${UPDATED_MAJORS[@]}")"
+	log "Updated Joomla base versions for targets: $(join_with_commas "${UPDATED_TARGETS[@]}")"
 fi
 
 if [[ "$DIGESTS_CHANGED" == "yes" ]]; then
@@ -917,5 +920,13 @@ fi
 write_github_output "changed" "$CHANGED"
 write_github_output "versions_changed" "$VERSIONS_CHANGED"
 write_github_output "digests_changed" "$DIGESTS_CHANGED"
+write_github_output "updated_targets" "$(join_with_commas "${UPDATED_TARGETS[@]}")"
+write_github_output "waiting_targets" "$(join_with_commas "${WAITING_TARGETS[@]}")"
+if [[ "${#UPDATED_MAJORS[@]}" -gt 0 ]]; then
+	mapfile -t UPDATED_MAJORS < <(printf '%s\n' "${UPDATED_MAJORS[@]}" | sort -V)
+fi
+if [[ "${#WAITING_MAJORS[@]}" -gt 0 ]]; then
+	mapfile -t WAITING_MAJORS < <(printf '%s\n' "${WAITING_MAJORS[@]}" | sort -V)
+fi
 write_github_output "updated_majors" "$(join_with_commas "${UPDATED_MAJORS[@]}")"
 write_github_output "waiting_majors" "$(join_with_commas "${WAITING_MAJORS[@]}")"
