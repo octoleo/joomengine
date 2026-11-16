@@ -2,6 +2,7 @@
 	"schema": 1,
 	"image": "octoleo/joomengine",
 	"baseImage": "joomla",
+	"publishLast": ["latest-mcp-dev", "latest-dev", "latest-mcp", "latest"],
 	"profiles": {
 		"standard": { "suffix": "" },
 		"dev": { "suffix": "-dev" }

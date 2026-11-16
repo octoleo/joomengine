@@ -18,6 +18,8 @@ image_config_validate() {
 		def image: text and test("^[a-z0-9][a-z0-9._/-]*$");
 		. as $config | type == "object" and .schema == 1 and
 		(.image | image) and (.baseImage | image) and
+		(.publishLast | type == "array" and length == (unique | length)) and
+		all(.publishLast[]; text and test("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")) and
 		(.profiles | type == "object" and length > 0) and
 		all(.profiles | to_entries[];
 			(.key | text and test("^[a-z][a-z0-9_-]*$")) and

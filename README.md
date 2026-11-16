@@ -236,6 +236,27 @@ The publisher builds changed images, verifies their multi-platform publication,
 and promotes rolling/default aliases only after all required builds succeed.
 Successful build state is committed only after that publication completes.
 
+`conf/build.json` controls the final build and alias-publication order with
+`publishLast`, listed from first to last:
+
+```json
+"publishLast": ["latest-mcp-dev", "latest-dev", "latest-mcp", "latest"]
+```
+
+Whenever a publishing run has any image or alias update, it rebuilds the images
+owning these aliases after all other changed images, even if their own inputs
+are unchanged. It then publishes all other aliases before this final sequence,
+leaving normal JCB `latest` as the last build and the last tag published.
+BuildKit may reuse unchanged layers. A completely unchanged run does nothing.
+Aliases absent from the selected matrix are skipped; shared image owners build
+once at their last configured position. An empty array disables this policy.
+`--dry-run` shows this plan; `--build-only` orders its changed images the same
+way but does not force unchanged defaults or publish to the registry.
+
+This controls registry publication order. Docker Hub controls its display order;
+Docker itself always uses `latest` when no tag is supplied, regardless of which
+image was pushed most recently.
+
 ## Tag policy
 
 All release combinations have a full tag of the form

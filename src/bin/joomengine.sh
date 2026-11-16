@@ -300,7 +300,8 @@ if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]] || ! upstream_state_covers_matrix; then
 fi
 
 # Resolve one verified stable MCP release for this entire batch. Only MCP
-# fingerprints include this metadata, so MCP updates leave plain images alone.
+# fingerprints include this metadata. Unchanged publication-tail images are
+# refreshed separately so a partial update still ends with the default images.
 MCP_PACKAGE_JSON="$(mcp_fetch_package "$MCP_UPDATE_URL")"
 MCP_BUILD_INPUT_SHA="$(
 	{
@@ -1289,6 +1290,14 @@ load_new_alias_topology() {
 
 	if [[ "$OLD_ALIAS_TOPOLOGY_SHA" != "$NEW_ALIAS_TOPOLOGY_SHA" ]]; then
 		ALIAS_TOPOLOGY_CHANGED="yes"
+	fi
+	count_pending_alias_promotions
+}
+
+count_pending_alias_promotions() {
+	local full_tag full_base_image
+	PENDING_ALIAS_PROMOTION_COUNT=0
+	if [[ "$ALIAS_TOPOLOGY_CHANGED" == "yes" ]]; then
 		PENDING_ALIAS_PROMOTION_COUNT="${#NEW_ALIAS_BASE[@]}"
 	else
 		for full_tag in "${!NEW_ALIAS_BASE[@]}"; do
@@ -1298,6 +1307,43 @@ load_new_alias_topology() {
 			fi
 		done
 	fi
+}
+
+# The JSON array is chronological: its final tag is published last. Resolve
+# actual alias ownership so profile/target ordering cannot change this policy.
+# Absent aliases are valid for matrices without MCP, dev or Apache images.
+declare -a FINAL_ALIASES=()
+declare -A FINAL_ALIAS_SET=()
+declare -A FINAL_BUILD_ALIAS=()
+
+plan_final_publications() {
+	local tag full_tag full_base_image line key
+	while IFS= read -r tag; do
+		full_tag="${IMAGE_NAME}:${tag}"
+		full_base_image="${NEW_ALIAS_BASE[$full_tag]:-}"
+		[[ -n "$full_base_image" ]] || continue
+		FINAL_ALIASES+=("$full_tag")
+		FINAL_ALIAS_SET["$full_tag"]=1
+		# If several configured aliases share one image, build it at its last
+		# position rather than rebuilding it for each alias.
+		FINAL_BUILD_ALIAS["$full_base_image"]="$full_tag"
+	done < <(jq -r '.publishLast[]' "$BUILD_CONFIG_FILE")
+
+	# Local loads keep incremental behavior. A publishing batch refreshes all
+	# configured defaults whenever any build or alias promotion is required.
+	[[ "$BUILD_ONLY" == "no" ]] || return 0
+	[[ "$PENDING_BUILD_COUNT" -gt 0 || "$PENDING_ALIAS_PROMOTION_COUNT" -gt 0 ]] || return 0
+	for full_tag in "${FINAL_ALIASES[@]}"; do
+		full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
+		line="${NEW_BASE_RECORD[$full_base_image]}"
+		is_pending_build "$line" && continue
+		key="$(manifest_build_key "$line")"
+		PENDING_BUILDS["$key"]=1
+		PENDING_BASE_IMAGES["$full_base_image"]=1
+		PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
+		echo "  ↪ Scheduling final refresh for $full_tag"
+	done
+	count_pending_alias_promotions
 }
 
 builder_platform_key() {
@@ -1398,6 +1444,7 @@ declare -A REQUIRED_BUILDER_PLATFORMS=()
 
 load_previous_alias_topology || exit 1
 load_new_alias_topology || exit 1
+plan_final_publications || exit 1
 
 while IFS= read -r line || [[ -n "$line" ]]; do
 	[[ -z "$line" ]] && continue
@@ -1732,36 +1779,32 @@ promote_planned_alias() {
 }
 
 # --------------------------------------------------
-# build the all images except the latest image (first)
+# Build ordinary pending images before the configured publication tail.
 # --------------------------------------------------
 while IFS= read -r line || [[ -n "$line" ]]; do
 	[[ -z "$line" ]] && continue
 	is_pending_build "$line" || continue
 
-	latest=$(echo "$line" | jq -r 'if .latest == "yes" or .latest_mcp == "yes" then "yes" else "no" end')
-
-	[[ "$latest" == "yes" ]] && continue
+	full_base_image="$(jq -r '.image + ":" + .base_tag' <<< "$line")"
+	[[ -n "${FINAL_BUILD_ALIAS[$full_base_image]:-}" ]] && continue
 
 	build_image "$line"
 done < "$BUILD_MANIFEST_FILE"
 
 # --------------------------------------------------
-# build the latest image (last)
+# Build each final image once, in the order specified by publishLast.
 # --------------------------------------------------
-while IFS= read -r line || [[ -n "$line" ]]; do
-	[[ -z "$line" ]] && continue
+for full_tag in "${FINAL_ALIASES[@]}"; do
+	full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
+	[[ "${FINAL_BUILD_ALIAS[$full_base_image]}" == "$full_tag" ]] || continue
+	line="${NEW_BASE_RECORD[$full_base_image]}"
 	is_pending_build "$line" || continue
-
-	latest=$(echo "$line" | jq -r 'if .latest == "yes" or .latest_mcp == "yes" then "yes" else "no" end')
-
-	[[ "$latest" == "no" ]] && continue
-
 	build_image "$line"
-done < "$BUILD_MANIFEST_FILE"
+done
 
 # --------------------------------------------------
 # Reconcile aliases only after every immutable base build and verification
-# succeeded. Topology-only alias changes are promoted without a base rebuild.
+# succeeded, then promote the configured final aliases in their exact order.
 # --------------------------------------------------
 declare -a PLANNED_ALIASES=()
 if [[ "${#NEW_ALIAS_BASE[@]}" -gt 0 ]]; then
@@ -1769,11 +1812,10 @@ if [[ "${#NEW_ALIAS_BASE[@]}" -gt 0 ]]; then
 fi
 
 for full_tag in "${PLANNED_ALIASES[@]}"; do
-	[[ "$full_tag" == *:latest || "$full_tag" == *:latest-mcp ]] && continue
+	[[ -n "${FINAL_ALIAS_SET[$full_tag]:-}" ]] && continue
 	promote_planned_alias "$full_tag"
 done
-for full_tag in "${PLANNED_ALIASES[@]}"; do
-	[[ "$full_tag" == *:latest || "$full_tag" == *:latest-mcp ]] || continue
+for full_tag in "${FINAL_ALIASES[@]}"; do
 	promote_planned_alias "$full_tag"
 done
 
