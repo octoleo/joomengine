@@ -137,6 +137,8 @@ jobs:
           DIGESTS_CHANGED: ${{ steps.releases.outputs.digests_changed }}
           UPDATED_MAJORS: ${{ steps.releases.outputs.updated_majors }}
           WAITING_MAJORS: ${{ steps.releases.outputs.waiting_majors }}
+          UPDATED_TARGETS: ${{ steps.releases.outputs.updated_targets }}
+          WAITING_TARGETS: ${{ steps.releases.outputs.waiting_targets }}
           MCP_CHANGED: ${{ steps.mcp.outputs.changed }}
           MCP_VERSION: ${{ steps.mcp.outputs.mcp_version }}
         shell: bash
@@ -144,13 +146,15 @@ jobs:
           set -euo pipefail
 
           {
-            echo "## Joomla and MCP stable release poll"
+            echo "## Joomla base images and MCP release poll"
             echo
             echo "- Repository state changed: ${CHANGED:-no}"
             echo "- Joomla versions changed: ${VERSIONS_CHANGED:-no}"
             echo "- Base image digests changed: ${DIGESTS_CHANGED:-no}"
             echo "- Updated majors: ${UPDATED_MAJORS:-none}"
-            echo "- Waiting for Docker tags: ${WAITING_MAJORS:-none}"
+            echo "- Updated targets: ${UPDATED_TARGETS:-none}"
+            echo "- Waiting Joomla majors: ${WAITING_MAJORS:-none}"
+            echo "- Targets waiting for Docker tags: ${WAITING_TARGETS:-none}"
             echo "- MCP image rebuild needed: ${MCP_CHANGED:-no}"
             echo "- Latest stable MCP package: ${MCP_VERSION:-unavailable}"
           } >> "$GITHUB_STEP_SUMMARY"

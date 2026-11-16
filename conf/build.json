@@ -2,7 +2,6 @@
 	"schema": 1,
 	"image": "octoleo/joomengine",
 	"baseImage": "joomla",
-	"defaultProfile": "dev",
 	"profiles": {
 		"standard": { "suffix": "" },
 		"dev": { "suffix": "-dev" }

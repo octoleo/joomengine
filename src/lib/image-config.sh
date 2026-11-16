@@ -25,8 +25,7 @@ image_config_validate() {
 			(.value.suffix | text and test("^(-[a-z0-9][a-z0-9-]*)?$"))) and
 		(.profiles.standard.suffix == "") and
 		([.profiles[].suffix] | length == (unique | length)) and
-		(.defaultProfile | text) and
-		(. as $c | .profiles | has($c.defaultProfile)) and
+		(has("defaultProfile") | not) and
 		(.sources | type == "object") and
 		(.sources.joomla_releases_url | url) and
 		(.sources.joomla_repository | image) and

@@ -210,9 +210,12 @@ if [[ ! -f "$MAINTAINERS_JSON_FILE" ]]; then
 fi
 
 IMAGE_CONFIG_HELPER="$REPO_ROOT/src/lib/image-config.sh"
+BUILD_TARGETS_HELPER="$REPO_ROOT/src/lib/build-targets.sh"
 MCP_HELPER="$REPO_ROOT/src/lib/mcp-package.sh"
 # shellcheck source=src/lib/image-config.sh
 source "$IMAGE_CONFIG_HELPER"
+# shellcheck source=src/lib/build-targets.sh
+source "$BUILD_TARGETS_HELPER"
 
 IMAGES_PATH="$REPO_ROOT/images"
 LOG_PATH="$REPO_ROOT/log"
@@ -232,30 +235,12 @@ image_config_validate "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE"
 IMAGE_NAME="$(jq -er '.image' "$BUILD_CONFIG_FILE")"
 BASE_IMAGE_NAME="$(jq -er '.baseImage' "$BUILD_CONFIG_FILE")"
 BASE_REPOSITORY="$(jq -er '.sources.joomla_repository' "$BUILD_CONFIG_FILE")"
-DEFAULT_PROFILE="$(jq -er '.defaultProfile' "$BUILD_CONFIG_FILE")"
 # shellcheck source=src/lib/mcp-package.sh
 source "$MCP_HELPER"
 MCP_UPDATE_URL="$(mcp_update_url "$BUILD_CONFIG_FILE")"
 
-# A profile selects development tooling independently of the HTTP runtime and
-# MCP package flavor. Every configured selector must resolve before generation.
-if ! jq -e --slurpfile build "$BUILD_CONFIG_FILE" '
-	type == "object" and length > 0 and all(to_entries[];
-		.key as $major | .value as $series |
-		($major | test("^[0-9]+$")) and
-		($series.joomla | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
-		($series.php | type == "array" and length > 0 and length == (unique | length) and
-			all(.[]; type == "string" and test("^[0-9]+\\.[0-9]+$"))) and
-		($series.variants | type == "array" and length > 0 and length == (unique | length) and
-			all(.[]; . == "apache" or . == "fpm" or . == "fpm-alpine")) and
-		(($series.profiles // ["standard"]) | type == "array" and length > 0 and
-			length == (unique | length) and all(.[]; $build[0].profiles[.] != null)) and
-		($build[0].sources.jcb_updates[$major] | type == "string" and length > 0)
-	)
-' "$VERSIONS_JSON_FILE" >/dev/null; then
-	echo '[ERROR] Invalid image matrix or missing JSON release source/profile' >&2
-	exit 1
-fi
+# Targets keep Joomla release channels independent of the selected JCB releases.
+NORMALIZED_TARGETS_JSON="$(build_targets_normalize "$VERSIONS_JSON_FILE" "$BUILD_CONFIG_FILE")"
 
 validate_upstream_image_state() {
 	jq -e --arg repository "$BASE_REPOSITORY" '
@@ -282,9 +267,9 @@ validate_upstream_image_state() {
 # digest state. Resolve the complete configured matrix before any build work;
 # the release detector preserves these versions with --refresh-current.
 upstream_state_covers_matrix() {
-	jq -e --slurpfile versions "$VERSIONS_JSON_FILE" --slurpfile build "$BUILD_CONFIG_FILE" '
+	jq -e --argjson targets "$NORMALIZED_TARGETS_JSON" --slurpfile build "$BUILD_CONFIG_FILE" '
 		.tags as $tags |
-		[$versions[0][] | .joomla as $joomla | (.profiles // ["standard"])[] as $profile |
+		[$targets[] | .joomla as $joomla | .profiles[] as $profile |
 			.php[] as $php | .variants[] |
 			($joomla + "-php" + $php + "-" + . + $build[0].profiles[$profile].suffix)] |
 		length > 0 and all(.[]; $tags[.] != null)
@@ -386,15 +371,19 @@ fi
 # Any change to these inputs changes the generated image even if the upstream
 # Joomla and JCB versions remain the same.
 BUILD_INPUT_SHA="$(
-	for input_file in \
-		"$SCRIPT_PATH" \
-		"$IMAGE_CONFIG_HELPER" \
-		"$BUILD_CONFIG_FILE" \
-		"$MAINTAINERS_JSON_FILE"; do
-		sha256sum "$input_file" | awk '{ print $1 }'
-	done \
-		| sha256sum \
-		| awk '{ print $1 }'
+	{
+		for input_file in \
+			"$SCRIPT_PATH" \
+			"$IMAGE_CONFIG_HELPER" \
+			"$BUILD_TARGETS_HELPER" \
+			"$BUILD_CONFIG_FILE" \
+			"$MAINTAINERS_JSON_FILE"; do
+			sha256sum "$input_file" | awk '{ print $1 }'
+		done
+		# A target policy can change the immutable published tag without changing
+		# package bytes. Rebuild the configured publication when its JSON changes.
+		jq -cS . <<< "$NORMALIZED_TARGETS_JSON"
+	} | sha256sum | awk '{ print $1 }'
 )"
 
 get_base_image_index_digest() {
@@ -531,13 +520,14 @@ ver_max() {
 # --------------------------------------------------
 # LOAD MAJORS
 # --------------------------------------------------
-mapfile -t MAJORS < <(jq -r 'keys[]' "$VERSIONS_JSON_FILE")
+mapfile -t TARGET_IDS < <(jq -r 'keys[]' <<< "$NORMALIZED_TARGETS_JSON")
 
 # --------------------------------------------------
-# PASS 1: CONTEXT GENERATION + RELEASE COLLECTION
+# PASS 1: TARGET RELEASE SELECTION AND CONTEXT GENERATION
 # --------------------------------------------------
-declare -a REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_INPUT_SHA REL_JOOMLA
-declare -A PHP_LIST_BY_MAJOR VARIANT_LIST_BY_MAJOR PROFILE_LIST_BY_MAJOR DEFAULT_PROFILE_BY_MAJOR HIGHEST_PHP_BY_MAJOR PROCESSED_MAJORS
+declare -a REL_TARGET REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_INPUT_SHA REL_JOOMLA
+declare -A PHP_LIST_BY_TARGET VARIANT_LIST_BY_TARGET PROFILE_LIST_BY_TARGET HIGHEST_PHP_BY_TARGET
+declare -A JCB_ROWS_BY_MAJOR TARGET_TAG_POLICY TARGET_CHANNEL TARGET_JCB_SELECTOR
 declare -A PENDING_BUILDS MCP_COMPATIBLE
 PENDING_BUILD_COUNT=0
 EXPECTED_MANIFEST_RECORD_COUNT=0
@@ -572,79 +562,116 @@ select_image_flavor() {
 	fi
 }
 
-for MAJOR in "${MAJORS[@]}"; do
-	echo
-	echo "▶ Processing major $MAJOR"
+# Release order preserves the existing convention that an unnumbered alpha,
+# beta or RC is the latest build of that prerelease channel.
+jcb_release_order_key() (
+	parse_version "$1" || return 1
+	printf '%s-%s%s\n' "$V_PATCH" "$V_PR" "$V_PR_NUM"
+)
 
-	XML_URL="$(jq -er --arg major "$MAJOR" '.sources.jcb_updates[$major]' "$BUILD_CONFIG_FILE")"
-	TMP_XML="$(mktemp)"
-
-	if ! curl \
-		--fail \
-		--silent \
-		--show-error \
-		--location \
-		--retry 3 \
-		--retry-delay 2 \
-		--retry-connrefused \
-		--connect-timeout 15 \
-		--max-time 60 \
-		--output "$TMP_XML" \
-		"$XML_URL"; then
-		echo "❌ Failed to fetch XML for $MAJOR" >&2
-		rm -f "$TMP_XML"
-		exit 1
+jcb_release_max() {
+	local previous="$1" candidate="$2"
+	if [[ -z "$previous" ]] || [[ "$(ver_max "$(jcb_release_order_key "$previous")" "$(jcb_release_order_key "$candidate")")" == "$(jcb_release_order_key "$candidate")" ]]; then
+		printf '%s\n' "$candidate"
+	else
+		printf '%s\n' "$previous"
 	fi
+}
 
-	mapfile -t PHP_VERSIONS < <(jq -r ".\"$MAJOR\".php[]" "$VERSIONS_JSON_FILE")
-	mapfile -t VARIANTS < <(jq -r ".\"$MAJOR\".variants[]" "$VERSIONS_JSON_FILE")
-	mapfile -t PROFILES < <(jq -r --arg major "$MAJOR" '.[$major].profiles // ["standard"] | .[]' "$VERSIONS_JSON_FILE")
-	JOOMLA_VERSION="$(jq -r --arg m "$MAJOR" '.[$m].joomla' "$VERSIONS_JSON_FILE")"
-
-	PHP_LIST_BY_MAJOR["$MAJOR"]="${PHP_VERSIONS[*]}"
-	VARIANT_LIST_BY_MAJOR["$MAJOR"]="${VARIANTS[*]}"
-	PROFILE_LIST_BY_MAJOR["$MAJOR"]="${PROFILES[*]}"
-	DEFAULT_PROFILE_BY_MAJOR["$MAJOR"]="${PROFILES[0]}"
-	for PROFILE in "${PROFILES[@]}"; do
-		if [[ "$PROFILE" == "$DEFAULT_PROFILE" ]]; then
-			DEFAULT_PROFILE_BY_MAJOR["$MAJOR"]="$PROFILE"
-		fi
-	done
-
+for TARGET_ID in "${TARGET_IDS[@]}"; do
+	TARGET_JSON="$(jq -c --arg target "$TARGET_ID" '.[$target]' <<< "$NORMALIZED_TARGETS_JSON")"
+	MAJOR="$(jq -r '.jcb.major' <<< "$TARGET_JSON")"
+	JOOMLA_VERSION="$(jq -r '.joomla' <<< "$TARGET_JSON")"
+	TARGET_TAG_POLICY["$TARGET_ID"]="$(jq -r '.tags' <<< "$TARGET_JSON")"
+	TARGET_CHANNEL["$TARGET_ID"]="$(jq -r '.channel' <<< "$TARGET_JSON")"
+	TARGET_JCB_SELECTOR["$TARGET_ID"]="$(jq -c '.jcb.versions' <<< "$TARGET_JSON")"
+	mapfile -t PHP_VERSIONS < <(jq -r '.php[]' <<< "$TARGET_JSON")
+	mapfile -t VARIANTS < <(jq -r '.variants[]' <<< "$TARGET_JSON")
+	mapfile -t PROFILES < <(jq -r '.profiles[]' <<< "$TARGET_JSON")
+	PHP_LIST_BY_TARGET["$TARGET_ID"]="${PHP_VERSIONS[*]}"
+	VARIANT_LIST_BY_TARGET["$TARGET_ID"]="${VARIANTS[*]}"
+	PROFILE_LIST_BY_TARGET["$TARGET_ID"]="${PROFILES[*]}"
 	for p in "${PHP_VERSIONS[@]}"; do
-		HIGHEST_PHP_BY_MAJOR["$MAJOR"]="$(ver_max "${HIGHEST_PHP_BY_MAJOR[$MAJOR]:-}" "$p")"
+		HIGHEST_PHP_BY_TARGET["$TARGET_ID"]="$(ver_max "${HIGHEST_PHP_BY_TARGET[$TARGET_ID]:-}" "$p")"
 	done
 
-	mapfile -t RELEASES < <(
-		xmlstarlet sel -t -m "/updates/update" \
-			-v "version" -o "|" \
-			-v "downloads/downloadurl" -o "|" \
-			-v "tags/tag" -o "|" \
-			-v "sha512" -n \
-		"$TMP_XML" | grep "^$MAJOR\."
-	)
-
-	if [[ "${#RELEASES[@]}" -eq 0 ]]; then
-		echo "❌ No releases found for $MAJOR" >&2
+	echo
+	echo "▶ Processing target $TARGET_ID (JCB $MAJOR, Joomla $JOOMLA_VERSION)"
+	if [[ -z "${JCB_ROWS_BY_MAJOR[$MAJOR]:-}" ]]; then
+		XML_URL="$(jq -er --arg major "$MAJOR" '.sources.jcb_updates[$major]' "$BUILD_CONFIG_FILE")"
+		TMP_XML="$(mktemp)"
+		if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+			--retry-connrefused --connect-timeout 15 --max-time 60 \
+			--output "$TMP_XML" "$XML_URL"; then
+			echo "[ERROR] Failed to fetch JCB update XML for $MAJOR" >&2
+			rm -f "$TMP_XML"
+			exit 1
+		fi
+		if ! JCB_ROWS_BY_MAJOR["$MAJOR"]="$(xmlstarlet sel -t -m '/updates/update' \
+			-v version -o '|' -v downloads/downloadurl -o '|' -v tags/tag -o '|' \
+			-v sha512 -n "$TMP_XML" | grep "^$MAJOR\.")"; then
+			echo "[ERROR] No valid JCB release records found for major $MAJOR" >&2
+			rm -f "$TMP_XML"
+			exit 1
+		fi
 		rm -f "$TMP_XML"
-		exit 1
+	fi
+	mapfile -t RELEASES <<< "${JCB_ROWS_BY_MAJOR[$MAJOR]}"
+	SELECTOR_JSON="${TARGET_JCB_SELECTOR[$TARGET_ID]}"
+	SELECTOR_TYPE="$(jq -r type <<< "$SELECTOR_JSON")"
+	SELECTED_RELEASES=()
+	if [[ "$SELECTOR_TYPE" == array ]]; then
+		mapfile -t REQUESTED_VERSIONS < <(jq -r '.[]' <<< "$SELECTOR_JSON")
+		for REQUESTED_VERSION in "${REQUESTED_VERSIONS[@]}"; do
+			FOUND_RELEASE=no
+			for ROW in "${RELEASES[@]}"; do
+				[[ "${ROW%%|*}" == "$REQUESTED_VERSION" ]] || continue
+				SELECTED_RELEASES+=("$ROW")
+				FOUND_RELEASE=yes
+			done
+			if [[ "$FOUND_RELEASE" == no ]]; then
+				echo "[ERROR] Target $TARGET_ID requires missing JCB release $REQUESTED_VERSION" >&2
+				exit 1
+			fi
+		done
+	else
+		SELECTOR="$(jq -r . <<< "$SELECTOR_JSON")"
+		if [[ "$SELECTOR" == all ]]; then
+			SELECTED_RELEASES=("${RELEASES[@]}")
+		else
+			SELECTED_ORDER=''
+			SELECTED_ROW=''
+			for ROW in "${RELEASES[@]}"; do
+				VERSION="${ROW%%|*}"
+				parse_version "$VERSION"
+				if [[ "$SELECTOR" == latest-stable ]]; then
+					[[ "$V_IS_STABLE" == yes ]] || continue
+				else
+					[[ "$V_PR" == "${SELECTOR#latest-}" ]] || continue
+				fi
+				ORDER="$(jcb_release_order_key "$VERSION")"
+				if [[ -z "$SELECTED_ROW" || "$(ver_max "$SELECTED_ORDER" "$ORDER")" == "$ORDER" ]]; then
+					SELECTED_ORDER="$ORDER"
+					SELECTED_ROW="$ROW"
+				fi
+			done
+			if [[ -z "$SELECTED_ROW" ]]; then
+				echo "[ERROR] Target $TARGET_ID has no JCB release matching $SELECTOR" >&2
+				exit 1
+			fi
+			SELECTED_RELEASES=("$SELECTED_ROW")
+		fi
 	fi
 
-	for ROW in "${RELEASES[@]}"; do
-		IFS='|' read -r VERSION URL TAG SHA <<<"$ROW"
-
+	for ROW in "${SELECTED_RELEASES[@]}"; do
+		IFS='|' read -r VERSION URL TAG SHA <<< "$ROW"
+		parse_version "$VERSION"
 		if [[ -z "$SHA" ]]; then
-			echo "❌ Missing SHA for $VERSION in major $MAJOR" >&2
-			rm -f "$TMP_XML"
-				exit 1
+			echo "[ERROR] Missing SHA for JCB $VERSION in target $TARGET_ID" >&2
+			exit 1
 		fi
-
-		RELEASE_INPUT_SHA="$(
-			printf '%s\n' "$VERSION" "$URL" "$TAG" "$SHA" |
-				sha256sum |
-				awk '{ print $1 }'
-		)"
-
+		RELEASE_INPUT_SHA="$(printf '%s\n' "$VERSION" "$URL" "$TAG" "$SHA" | sha256sum | awk '{print $1}')"
+		REL_TARGET+=("$TARGET_ID")
 		REL_MAJOR+=("$MAJOR")
 		REL_VERSION+=("$VERSION")
 		REL_URL+=("$URL")
@@ -652,72 +679,102 @@ for MAJOR in "${MAJORS[@]}"; do
 		REL_SHA+=("$SHA")
 		REL_INPUT_SHA+=("$RELEASE_INPUT_SHA")
 		REL_JOOMLA+=("$JOOMLA_VERSION")
+	done
+done
 
-		for PHP in "${PHP_VERSIONS[@]}"; do
-			for PROFILE in "${PROFILES[@]}"; do
-				PROFILE_SUFFIX="$(image_profile_suffix "$BUILD_CONFIG_FILE" "$PROFILE")"
-				for VARIANT in "${VARIANTS[@]}"; do
-					BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}${PROFILE_SUFFIX}"
-					if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
-						echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
-						rm -f "$TMP_XML"
-						exit 1
-					fi
-					if ! select_base_platforms "$BASE_IMAGE_TAG"; then
-						rm -f "$TMP_XML"
-						exit 1
-					fi
-
-					select_image_flavors "$JOOMLA_VERSION" "$PHP"
-					for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
-						select_image_flavor
-						EXPECTED_MANIFEST_RECORD_COUNT=$((EXPECTED_MANIFEST_RECORD_COUNT + 1))
-						HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_INDEX_DIGEST} ${BASE_PLATFORM_STATE_SHA} ${SELECTED_PLATFORMS_CSV} ${FLAVOR} ${FLAVOR_MCP_INPUT_SHA} ${PROFILE}"
-						BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_INDEX_DIGEST}|${BASE_PLATFORM_STATE_SHA}|${SELECTED_PLATFORMS_CSV}|${FLAVOR}|${FLAVOR_MCP_INPUT_SHA}|${PROFILE}"
-						target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}"
-						target_dir="${IMAGES_PATH}/${target}"
-
-						if [[ "$FORCE_UPDATE" == "no" ]] && \
-							grep -Fxq -- "$HASH_RECORD" "$HASHES_FILE" && \
-							[[ -f "${target_dir}/Dockerfile" ]] && \
-							[[ ! -e "${target_dir}/docker-entrypoint.sh" ]]; then
-							echo "✅ JCB-${VERSION} PHP-${PHP} J-${JOOMLA_VERSION}(${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}) already built - skipping"
-							printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
-							continue
-						fi
-
-						PENDING_BUILDS["$BUILD_KEY"]=1
-						PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
-
-						mkdir -p "$target_dir"
-
-						echo "  -> generating ${target}"
-
-						# Remove the old generated adapter when migrating an existing context.
-						rm -f -- "${target_dir}/docker-entrypoint.sh"
-						IMAGE_METADATA="$(jq -cn \
-							--arg joomla "$JOOMLA_VERSION" --arg php "$PHP" \
-							--arg variant "$VARIANT" --arg profile "$PROFILE" \
-							--arg base_digest "$BASE_IMAGE_INDEX_DIGEST" \
-							--arg version "$VERSION" --arg url "$URL" --arg sha512 "$SHA" \
-							--argjson mcp "$FLAVOR_MCP_JSON" \
-							'{joomla:$joomla,php:$php,variant:$variant,profile:$profile,
-							  base_digest:$base_digest,jcb:{version:$version,url:$url,sha512:$sha512},mcp:$mcp}')"
-						{
-							generated_warning
-							image_render_dockerfile "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE" "$IMAGE_METADATA"
-						} > "${target_dir}/Dockerfile"
-
-						printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
-					done
-				done
+# Reject overlapping image selectors before generating even the first context.
+# A target name does not make identical JCB/Joomla/PHP/runtime bytes distinct.
+declare -A PLANNED_CONTEXT_OWNER=()
+for i in "${!REL_VERSION[@]}"; do
+	TARGET_ID="${REL_TARGET[$i]}"
+	IFS=' ' read -r -a PHP_VERSIONS <<< "${PHP_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a VARIANTS <<< "${VARIANT_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a PROFILES <<< "${PROFILE_LIST_BY_TARGET[$TARGET_ID]}"
+	for PHP in "${PHP_VERSIONS[@]}"; do
+		for PROFILE in "${PROFILES[@]}"; do
+			for VARIANT in "${VARIANTS[@]}"; do
+				SELECTOR_KEY="${REL_VERSION[$i]}|${REL_JOOMLA[$i]}|$PHP|$VARIANT|$PROFILE"
+				if [[ -n "${PLANNED_CONTEXT_OWNER[$SELECTOR_KEY]:-}" ]]; then
+					echo "[ERROR] Overlapping image selection in targets ${PLANNED_CONTEXT_OWNER[$SELECTOR_KEY]} and $TARGET_ID: $SELECTOR_KEY" >&2
+					exit 1
+				fi
+				PLANNED_CONTEXT_OWNER["$SELECTOR_KEY"]="$TARGET_ID"
 			done
-
 		done
 	done
+done
 
-	PROCESSED_MAJORS["$MAJOR"]=1
-	rm -f "$TMP_XML"
+for i in "${!REL_VERSION[@]}"; do
+	TARGET_ID="${REL_TARGET[$i]}"
+	MAJOR="${REL_MAJOR[$i]}"
+	VERSION="${REL_VERSION[$i]}"
+	URL="${REL_URL[$i]}"
+	TAG="${REL_TAG[$i]}"
+	SHA="${REL_SHA[$i]}"
+	RELEASE_INPUT_SHA="${REL_INPUT_SHA[$i]}"
+	JOOMLA_VERSION="${REL_JOOMLA[$i]}"
+	IFS=' ' read -r -a PHP_VERSIONS <<< "${PHP_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a VARIANTS <<< "${VARIANT_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a PROFILES <<< "${PROFILE_LIST_BY_TARGET[$TARGET_ID]}"
+	for PHP in "${PHP_VERSIONS[@]}"; do
+		for PROFILE in "${PROFILES[@]}"; do
+			PROFILE_SUFFIX="$(image_profile_suffix "$BUILD_CONFIG_FILE" "$PROFILE")"
+			for VARIANT in "${VARIANTS[@]}"; do
+				BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}${PROFILE_SUFFIX}"
+				if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
+					echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+					exit 1
+				fi
+				if ! select_base_platforms "$BASE_IMAGE_TAG"; then
+					exit 1
+				fi
+
+				select_image_flavors "$JOOMLA_VERSION" "$PHP"
+				for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
+					select_image_flavor
+					EXPECTED_MANIFEST_RECORD_COUNT=$((EXPECTED_MANIFEST_RECORD_COUNT + 1))
+					HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_INDEX_DIGEST} ${BASE_PLATFORM_STATE_SHA} ${SELECTED_PLATFORMS_CSV} ${FLAVOR} ${FLAVOR_MCP_INPUT_SHA} ${PROFILE} ${TARGET_ID}"
+					BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_INDEX_DIGEST}|${BASE_PLATFORM_STATE_SHA}|${SELECTED_PLATFORMS_CSV}|${FLAVOR}|${FLAVOR_MCP_INPUT_SHA}|${PROFILE}|${TARGET_ID}"
+					target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${FLAVOR_SUFFIX}${PROFILE_SUFFIX}"
+					target_dir="${IMAGES_PATH}/${target}"
+
+					if [[ "$FORCE_UPDATE" == "no" ]] && \
+						grep -Fxq -- "$HASH_RECORD" "$HASHES_FILE" && \
+						[[ -f "${target_dir}/Dockerfile" ]] && \
+						[[ ! -e "${target_dir}/docker-entrypoint.sh" ]]; then
+						echo "✅ JCB-${VERSION} PHP-${PHP} J-${JOOMLA_VERSION}(${VARIANT}${FLAVOR_SUFFIX}${PROFILE_SUFFIX}) already built - skipping"
+						printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
+						continue
+					fi
+
+					PENDING_BUILDS["$BUILD_KEY"]=1
+					PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
+
+					mkdir -p "$target_dir"
+
+					echo "  -> generating ${target}"
+
+					# Remove the old generated adapter when migrating an existing context.
+					rm -f -- "${target_dir}/docker-entrypoint.sh"
+					IMAGE_METADATA="$(jq -cn \
+						--arg joomla "$JOOMLA_VERSION" --arg php "$PHP" \
+						--arg variant "$VARIANT" --arg profile "$PROFILE" \
+						--arg base_digest "$BASE_IMAGE_INDEX_DIGEST" \
+						--arg version "$VERSION" --arg url "$URL" --arg sha512 "$SHA" \
+						--argjson mcp "$FLAVOR_MCP_JSON" \
+						'{joomla:$joomla,php:$php,variant:$variant,profile:$profile,
+						  base_digest:$base_digest,jcb:{version:$version,url:$url,sha512:$sha512},mcp:$mcp}')"
+					{
+						generated_warning
+						image_render_dockerfile "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE" "$IMAGE_METADATA"
+					} > "${target_dir}/Dockerfile"
+
+					printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
+				done
+			done
+		done
+
+	done
 done
 
 # --------------------------------------------------
@@ -728,11 +785,13 @@ declare -A HIGHEST_PR_BY_MAJOR HIGHEST_PR_GLOBAL
 HIGHEST_STABLE_MCP_GLOBAL=""
 
 for i in "${!REL_VERSION[@]}"; do
+	TARGET_ID="${REL_TARGET[$i]}"
+	[[ "${TARGET_TAG_POLICY[$TARGET_ID]}" == default ]] || continue
 	parse_version "${REL_VERSION[$i]}" || continue
 	if [[ "$V_IS_STABLE" == "yes" ]]; then
 		HIGHEST_STABLE_BY_MAJOR["$V_MAJOR"]="$(ver_max "${HIGHEST_STABLE_BY_MAJOR[$V_MAJOR]:-}" "$V_PATCH")"
 		HIGHEST_STABLE_GLOBAL[all]="$(ver_max "${HIGHEST_STABLE_GLOBAL[all]:-}" "$V_PATCH")"
-		IFS=' ' read -r -a RELEASE_PHP_VERSIONS <<< "${PHP_LIST_BY_MAJOR[${REL_MAJOR[$i]}]}"
+		IFS=' ' read -r -a RELEASE_PHP_VERSIONS <<< "${PHP_LIST_BY_TARGET[$TARGET_ID]}"
 		for PHP in "${RELEASE_PHP_VERSIONS[@]}"; do
 			if [[ "${MCP_COMPATIBLE[${REL_JOOMLA[$i]}|$PHP]:-no}" == "yes" ]]; then
 				HIGHEST_STABLE_MCP_GLOBAL="$(ver_max "$HIGHEST_STABLE_MCP_GLOBAL" "$V_PATCH")"
@@ -741,8 +800,8 @@ for i in "${!REL_VERSION[@]}"; do
 		done
 	else
 		key="$V_MAJOR|$V_PR"
-		HIGHEST_PR_BY_MAJOR["$key"]="$(ver_max "${HIGHEST_PR_BY_MAJOR[$key]:-}" "$V_PATCH")"
-		HIGHEST_PR_GLOBAL["$V_PR"]="$(ver_max "${HIGHEST_PR_GLOBAL[$V_PR]:-}" "$V_PATCH")"
+		HIGHEST_PR_BY_MAJOR["$key"]="$(jcb_release_max "${HIGHEST_PR_BY_MAJOR[$key]:-}" "${REL_VERSION[$i]}")"
+		HIGHEST_PR_GLOBAL["$V_PR"]="$(jcb_release_max "${HIGHEST_PR_GLOBAL[$V_PR]:-}" "${REL_VERSION[$i]}")"
 	fi
 done
 
@@ -754,22 +813,26 @@ emit_tag() {
 }
 
 for i in "${!REL_VERSION[@]}"; do
+	TARGET_ID="${REL_TARGET[$i]}"
 	MAJOR="${REL_MAJOR[$i]}"
 	VERSION="${REL_VERSION[$i]}"
 	JOOMLA_VERSION="${REL_JOOMLA[$i]}"
 
 	parse_version "$VERSION" || continue
 
-	IFS=' ' read -r -a PHP_VERSIONS <<< "${PHP_LIST_BY_MAJOR[$MAJOR]}"
-	IFS=' ' read -r -a VARIANTS <<< "${VARIANT_LIST_BY_MAJOR[$MAJOR]}"
-	IFS=' ' read -r -a PROFILES <<< "${PROFILE_LIST_BY_MAJOR[$MAJOR]}"
-	HIGHEST_PHP="${HIGHEST_PHP_BY_MAJOR[$MAJOR]}"
+	IFS=' ' read -r -a PHP_VERSIONS <<< "${PHP_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a VARIANTS <<< "${VARIANT_LIST_BY_TARGET[$TARGET_ID]}"
+	IFS=' ' read -r -a PROFILES <<< "${PROFILE_LIST_BY_TARGET[$TARGET_ID]}"
+	HIGHEST_PHP="${HIGHEST_PHP_BY_TARGET[$TARGET_ID]}"
+	TAG_POLICY="${TARGET_TAG_POLICY[$TARGET_ID]}"
+	VERSION_TAG="$VERSION"
+	[[ "$TAG_POLICY" != qualified ]] || VERSION_TAG+="-joomla${JOOMLA_VERSION}"
 
 	# Determine leadership status
 	IS_HIGHEST_STABLE_MAJOR="no"
 	IS_HIGHEST_STABLE_GLOBAL="no"
 	IS_HIGHEST_STABLE_MCP_GLOBAL="no"
-	if [[ "$V_IS_STABLE" == "yes" ]]; then
+	if [[ "$TAG_POLICY" == default && "$V_IS_STABLE" == "yes" ]]; then
 		[[ "${HIGHEST_STABLE_BY_MAJOR[$V_MAJOR]:-}" == "$VERSION" ]] && IS_HIGHEST_STABLE_MAJOR="yes"
 		[[ "${HIGHEST_STABLE_GLOBAL[all]:-}" == "$VERSION" ]] && IS_HIGHEST_STABLE_GLOBAL="yes"
 		[[ "$HIGHEST_STABLE_MCP_GLOBAL" == "$VERSION" ]] && IS_HIGHEST_STABLE_MCP_GLOBAL="yes"
@@ -777,7 +840,7 @@ for i in "${!REL_VERSION[@]}"; do
 
 	IS_HIGHEST_PRERELEASE_MAJOR="no"
 	IS_HIGHEST_PRERELEASE_GLOBAL="no"
-	if [[ "$V_IS_STABLE" == "no" ]]; then
+	if [[ "$TAG_POLICY" == default && "$V_IS_STABLE" == "no" ]]; then
 		key="${V_MAJOR}|${V_PR}"
 		[[ "${HIGHEST_PR_BY_MAJOR[$key]:-}" == "$VERSION" ]] && IS_HIGHEST_PRERELEASE_MAJOR="yes"
 		[[ "${HIGHEST_PR_GLOBAL[$V_PR]:-}" == "$VERSION" ]] && IS_HIGHEST_PRERELEASE_GLOBAL="yes"
@@ -794,7 +857,7 @@ for i in "${!REL_VERSION[@]}"; do
 					IMAGE_TAGS=()
 
 					emit_once() {
-						local t="$1${2-$PROFILE_SUFFIX}$FLAVOR_SUFFIX"
+						local t="$1$FLAVOR_SUFFIX$PROFILE_SUFFIX"
 						if [[ -z "${SEEN[$t]:-}" ]]; then
 							SEEN["$t"]=1
 							IMAGE_TAGS+=("$t")
@@ -814,6 +877,7 @@ for i in "${!REL_VERSION[@]}"; do
 						echo "--------------------------------------------------"
 						echo "IMAGE    : $IMAGE_NAME"
 						echo "VERSION  : $VERSION"
+						echo "TARGET   : $TARGET_ID ($TAG_POLICY)"
 						echo "MAJOR    : $V_MAJOR"
 						echo "MINOR    : $V_MINOR"
 						echo "PHP      : $PHP (highest: $HIGHEST_PHP)"
@@ -826,18 +890,18 @@ for i in "${!REL_VERSION[@]}"; do
 					} >> "$TAG_LOG_FILE"
 
 					# ---- Base tag (always)
-					emit_once "${VERSION}-php${PHP}-${VARIANT}"
+					emit_once "${VERSION_TAG}-php${PHP}-${VARIANT}"
 
 					# ---- Apache shorthand
 					if [[ "$IS_APACHE" == "yes" ]]; then
-						emit_once "${VERSION}-php${PHP}"
+						emit_once "${VERSION_TAG}-php${PHP}"
 					fi
 
 					# ---- Highest PHP shorthand (variant-level + plain)
 					if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-						emit_once "${VERSION}-${VARIANT}"
+						emit_once "${VERSION_TAG}-${VARIANT}"
 						if [[ "$IS_APACHE" == "yes" ]]; then
-							emit_once "${VERSION}"
+							emit_once "${VERSION_TAG}"
 						fi
 					fi
 
@@ -871,10 +935,10 @@ for i in "${!REL_VERSION[@]}"; do
 					     [[ "$FLAVOR" == "mcp" && "$IS_HIGHEST_STABLE_MCP_GLOBAL" == "yes" ]]; } && \
 					   [[ "$IS_APACHE" == "yes" ]] && \
 					   [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-						# Explicit profile aliases remain usable when the default changes.
-						emit_once "latest-${PROFILE}" ""
-						if [[ "$PROFILE" == "${DEFAULT_PROFILE_BY_MAJOR[$MAJOR]}" ]]; then
-							emit_once "latest" ""
+						# Bare latest tags always select the normal runtime. Development
+						# tools are selected explicitly, with -dev as the final suffix.
+						emit_once "latest"
+						if [[ "$PROFILE" == "standard" ]]; then
 							if [[ "$FLAVOR" == "mcp" ]]; then
 								IS_LATEST_MCP="yes"
 							else
@@ -886,7 +950,7 @@ for i in "${!REL_VERSION[@]}"; do
 					# ---- Pre-release rolling tags
 					if [[ "$V_IS_STABLE" == "no" ]]; then
 						# Major-scoped leader for this pre-release type (numbered rolling tags)
-						if [[ "$IS_HIGHEST_PRERELEASE_MAJOR" == "yes" ]]; then
+						if [[ "$IS_HIGHEST_PRERELEASE_MAJOR" == "yes" && "$VERSION" =~ [0-9]$ ]]; then
 							# Minor/major numbered tags
 							emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
 							emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
@@ -927,7 +991,7 @@ for i in "${!REL_VERSION[@]}"; do
 						fi
 					fi
 
-					context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}"
+					context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${FLAVOR_SUFFIX}${PROFILE_SUFFIX}"
 					BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}${PROFILE_SUFFIX}"
 					if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
 						echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
@@ -940,6 +1004,10 @@ for i in "${!REL_VERSION[@]}"; do
 					jq -nc \
 						--arg image "$IMAGE_NAME" \
 						--arg context "$context_path" \
+						--arg target "$TARGET_ID" \
+						--arg joomla_channel "${TARGET_CHANNEL[$TARGET_ID]}" \
+						--arg tag_policy "$TAG_POLICY" \
+						--argjson jcb_selector "${TARGET_JCB_SELECTOR[$TARGET_ID]}" \
 						--arg version "$VERSION" \
 						--arg latest "$IS_LATEST" \
 						--arg latest_mcp "$IS_LATEST_MCP" \
@@ -965,6 +1033,10 @@ for i in "${!REL_VERSION[@]}"; do
 						'{
 							image: $image,
 							context: $context,
+							target: $target,
+							joomla_channel: $joomla_channel,
+							tag_policy: $tag_policy,
+							jcb_selector: $jcb_selector,
 							version: $version,
 							latest: $latest,
 							latest_mcp: $latest_mcp,
@@ -1031,7 +1103,8 @@ manifest_build_key() {
 			(.platforms | join(",")),
 			.flavor,
 			.mcp_input_sha,
-			.profile
+			.profile,
+			.target
 		] | join("|")
 	'
 }
@@ -1048,17 +1121,18 @@ validate_pending_manifest_record() {
 	local line="$1"
 	local computed_platform_state_sha
 
-	if ! jq -e '
+	if ! jq -e --slurpfile build "$BUILD_CONFIG_FILE" '
 		(.profile | type == "string" and length > 0) and
+		($build[0].profiles[.profile] != null) and
 		(.flavor == "standard" or .flavor == "mcp") and
-		(if .flavor == "mcp" then
+		($build[0].profiles[.profile].suffix as $suffix | if .flavor == "mcp" then
 			(.mcp | type == "object") and
 			(.mcp.sha512 | test("^[a-f0-9]{128}$")) and
 			(.mcp_input_sha | test("^[a-f0-9]{64}$")) and
-			all(.tags[]; endswith("-mcp"))
+			all(.tags[]; endswith("-mcp" + $suffix))
 		else
 			.mcp == null and .mcp_input_sha == "none" and
-			all(.tags[]; endswith("-mcp") | not)
+			all(.tags[]; endswith("-mcp" + $suffix) | not)
 		end) and
 		(.base_index_digest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
 		(.base_platform_state_sha | type == "string" and test("^[a-f0-9]{64}$")) and
@@ -1708,48 +1782,32 @@ if [[ "$PENDING_BUILD_COUNT" -eq 0 ]] && \
 	echo "ℹ️  No changed image inputs detected - nothing to build or publish"
 fi
 
-if [[ "$DRY_RUN" == "no" ]]; then
-	# Generated contexts intentionally track one Joomla base version per JCB
-	# major. Prune the previous Joomla-version directory only after the new
-	# contexts were built and published successfully.
-	for MAJOR in "${MAJORS[@]}"; do
-		[[ -n "${PROCESSED_MAJORS[$MAJOR]:-}" ]] || continue
-		JOOMLA_VERSION="$(jq -r --arg major "$MAJOR" '.[$major].joomla' "$VERSIONS_JSON_FILE")"
-
-		while IFS= read -r -d '' jcb_dir; do
-			current_context="${jcb_dir}/j${JOOMLA_VERSION}"
-			[[ -d "$current_context" ]] || continue
-
-			while IFS= read -r -d '' stale_context; do
-				case "$stale_context" in
-				"$IMAGES_PATH"/jcb*/j*)
-					echo "  ↪ Removing stale generated context: ${stale_context#"$REPO_ROOT"/}"
-					rm -rf -- "$stale_context"
-					;;
-				*)
-					echo "[ERROR] Refusing to remove unexpected path: $stale_context" >&2
-					exit 1
-					;;
-				esac
-			done < <(
-				find "$jcb_dir" \
-					-mindepth 1 \
-					-maxdepth 1 \
-					-type d \
-					-name 'j*' \
-					! -name "j${JOOMLA_VERSION}" \
-					-print0
-			)
-		done < <(
-			find "$IMAGES_PATH" \
-				-mindepth 1 \
-				-maxdepth 1 \
-				-type d \
-				-name "jcb${MAJOR}.*" \
-				-print0
-		)
+# Reconcile exact generated contexts after builds and alias promotions succeed,
+# or after a dry-run finishes reviewing their plan. This keeps the reviewed
+# generation tree aligned without changing publication state during dry-run.
+# This also removes obsolete PHP/profile/flavor paths
+# inside a retained Joomla directory, including the old -dev-mcp spelling.
+# Unmarked Dockerfiles and other user files are never removed.
+declare -A ACTIVE_CONTEXTS=()
+while IFS= read -r context_path; do
+	ACTIVE_CONTEXTS["$context_path"]=1
+done < <(jq -r '.context' "$BUILD_MANIFEST_FILE")
+while IFS= read -r -d '' generated_dockerfile; do
+	stale_context="${generated_dockerfile%/Dockerfile}"
+	context_key="${stale_context#"$IMAGES_PATH"/}"
+	[[ -z "${ACTIVE_CONTEXTS[$context_key]:-}" ]] || continue
+	grep -Fxq '# NOTE: THIS DOCKERFILE IS GENERATED VIA "src/bin/joomengine.sh"' "$generated_dockerfile" || continue
+	echo "  ↪ Removing stale generated Dockerfile: ${generated_dockerfile#"$REPO_ROOT"/}"
+	rm -f -- "$generated_dockerfile"
+	# Walk only empty parents under images; a retained context or unmanaged
+	# file stops the walk and protects its shared directory immediately.
+	while [[ "$stale_context" == "$IMAGES_PATH"/* ]]; do
+		rmdir -- "$stale_context" 2>/dev/null || break
+		stale_context="${stale_context%/*}"
 	done
+done < <(find "$IMAGES_PATH" -mindepth 5 -maxdepth 5 -type f -name Dockerfile -print0)
 
+if [[ "$DRY_RUN" == "no" ]]; then
 	# Registry alias topology is publication state, so only advance it after
 	# every immutable build, verification, and alias promotion has succeeded.
 	# Local build-only runs preserve the last known registry topology.

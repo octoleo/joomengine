@@ -96,7 +96,7 @@ printf 'ok - configurations can delegate the administrator password to runtime s
 for expression in \
 	'.profiles.dev.suffix = "\nRUN false"' \
 	'.profiles.dev.suffix = ""' \
-	'.defaultProfile = "absent"' \
+	'.defaultProfile = "dev"' \
 	'.environment.JOOMLA_ADMIN_EMAIL = "a\nb"' \
 	'.environment["BAD\n"] = "value"' \
 	'.environment.JCB_PACKAGE = "https://example.test/override.zip"' \

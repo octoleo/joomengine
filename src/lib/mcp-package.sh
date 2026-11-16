@@ -143,16 +143,24 @@ mcp_resolve_package() (
 # An unresolved PHP minor such as 8.3 is conservatively treated as 8.3.0.
 mcp_package_supports() {
 	local package_json="${1:-}" joomla_version="${2:-}" php_version="${3:-}"
-	local php_minimum target_platform status=0
+	local php_minimum target_platform joomla_base status=0
 	php_minimum="$(jq -er '.php_minimum | select(type == "string" and length > 0)' <<< "$package_json")" || { _mcp_error 'missing PHP minimum in package metadata'; return 2; }
 	target_platform="$(jq -er '.target_platform | select(type == "string" and length > 0)' <<< "$package_json")" || { _mcp_error 'missing targetplatform in package metadata'; return 2; }
-	joomla_version="$(_mcp_version_normalize "$joomla_version")" || { _mcp_error 'invalid Joomla version'; return 2; }
+	# Joomla prereleases use the same numeric compatibility range, while the
+	# package's explicit targetplatform expression still controls the major/minor.
+	# A Joomla 6-only package must not become eligible merely because a target is
+	# labelled as a Joomla 7 preview.
+	if [[ "$joomla_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-(alpha|beta|rc)[0-9]*$ ]]; then
+		joomla_base="${joomla_version%%-*}"
+	else
+		joomla_base="$(_mcp_version_normalize "$joomla_version")" || { _mcp_error 'invalid Joomla version'; return 2; }
+	fi
 	php_version="$(_mcp_version_normalize "$php_version")" || { _mcp_error 'invalid PHP version'; return 2; }
 	php_minimum="$(_mcp_version_normalize "$php_minimum")" || { _mcp_error 'invalid PHP minimum'; return 2; }
 	_mcp_platform_valid "$target_platform" || { _mcp_error 'invalid Joomla targetplatform expression'; return 2; }
-	_mcp_version_at_least "$joomla_version" '6.0.0' || return 1
+	_mcp_version_at_least "$joomla_base" '6.0.0' || return 1
 	_mcp_version_at_least "$php_version" "$php_minimum" || return 1
-	printf '%s\n' "$joomla_version" | LC_ALL=C grep -P -q -- "^(?:${target_platform})" || status=$?
+	printf '%s\n' "$joomla_base" | LC_ALL=C grep -P -q -- "^(?:${target_platform})" || status=$?
 	[[ "$status" -le 1 ]] || { _mcp_error 'unable to match Joomla targetplatform'; return 2; }
 	return "$status"
 }

@@ -106,28 +106,53 @@ jobs:
           destination=quality-contexts
           mkdir -p "$destination/images"
           jq -sc '
-            . as $all |
-            [group_by(.flavor)[] |
+            def stable_default:
+              .tag_policy == "default" and .joomla_channel == "stable" and
+              (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"));
+            def release_channel:
+              .version | if contains("-") then
+                capture("-(?<channel>alpha|beta|rc)").channel else "stable" end;
+            def release_key:
+              [(.version | split("-")[0] | split(".") | map(tonumber)),
+               (.version | split("-")[1] // "" | [scan("[0-9]+") | tonumber] | last // 0),
+               (.php | split(".") | map(tonumber))];
+            map(. + {target: (.target // .major),
+                     tag_policy: (.tag_policy // "default"),
+                     joomla_channel: (.joomla_channel // "stable")}) as $all |
+            [$all[] | select(stable_default)] as $defaults |
+            [$defaults | group_by(.flavor)[] |
               ([.[] | select(.latest == "yes" or .latest_mcp == "yes")] | first) //
-              ([.[] | select(.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] |
-                sort_by([(.version | split(".") | map(tonumber)),
-                         (.php | split(".") | map(tonumber))]) | last) |
-              select(. != null)
+              (sort_by(release_key) | last) | select(. != null)
             ] as $anchors |
             [$anchors[] as $anchor | $all[] |
-              select(.version == $anchor.version and .joomla == $anchor.joomla and
-                .php == $anchor.php and .flavor == $anchor.flavor)] as $current |
-            # Also exercise the oldest active series with a normal Apache base.
-            [$all[] | select(.flavor == "standard" and .profile == "standard" and
-              .variant == "apache" and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))] |
-            sort_by(.major | tonumber) |
+              select(.target == $anchor.target and .version == $anchor.version and
+                .joomla == $anchor.joomla and .php == $anchor.php and
+                .flavor == $anchor.flavor)] as $current |
+            # Retain a normal Apache sample on the highest earlier configured PHP.
+            [$anchors[] | select(.flavor == "standard") | . as $anchor |
+              [$all[] | select(.target == $anchor.target and .version == $anchor.version and
+                .joomla == $anchor.joomla and .profile == "standard" and
+                .flavor == "standard" and .variant == "apache" and
+                ((.php | split(".") | map(tonumber)) <
+                 ($anchor.php | split(".") | map(tonumber))))] |
+              sort_by(.php | split(".") | map(tonumber)) | last | select(. != null)
+            ] as $previous_php |
+            # Exercise qualified and preview-only targets separately from stable defaults.
+            [$all[] | .target as $target |
+              select(.tag_policy == "qualified" or
+                ([$defaults[] | select(.target == $target)] | length) == 0)] |
+            group_by([.target, .flavor, release_channel]) |
+            [.[] as $group | ($group | max_by(release_key)) as $anchor |
+              $group[] | select(.version == $anchor.version and .php == $anchor.php)
+            ] as $additional |
+            # Also exercise the oldest active stable series with a normal Apache base.
+            [$defaults[] | select(.flavor == "standard" and .profile == "standard" and
+              .variant == "apache")] | sort_by(.joomla | split(".") | map(tonumber)) |
             (if length == 0 then [] else
-              .[0].major as $oldest |
-              [.[] | select(.major == $oldest)] |
-              sort_by([(.version | split(".") | map(tonumber)),
-                       (.php | split(".") | map(tonumber))]) | [last]
+              .[0].target as $oldest |
+              [.[] | select(.target == $oldest)] | sort_by(release_key) | [last]
             end) as $historical |
-            ($current + $historical) | unique_by(.context) |
+            ($current + $previous_php + $additional + $historical) | unique_by(.context) |
             if length > 0 then . else error("No configured smoke contexts") end
           ' conf/manifest.ndjson > "$destination/selected.json"
 
@@ -151,19 +176,17 @@ jobs:
                if $record.variant == "apache" and
                   $record.base_platforms["linux/arm64/v8"] != null then
                  {platform: "linux/arm64/v8", architecture: "arm64"} else empty end) as $host |
-              ([$selected[] | select(.profile == "standard" and
+              ([$selected[] | select(.profile == "standard" and .target == $record.target and
                  .version == $record.version and .joomla == $record.joomla and
                  .php == $record.php and .variant == $record.variant and
                  .flavor == $record.flavor and
                  .base_platforms[$host.platform] != null)][0].context // "") as $normal |
-              {profile: $record.profile, flavor: $record.flavor,
+              {target: $record.target, profile: $record.profile, flavor: $record.flavor,
                variant: $record.variant, version: $record.version, php: $record.php,
                context: $record.context, platform: $host.platform,
                architecture: $host.architecture, normal_context: $normal,
-               image: ("joomengine-smoke:" + $record.version + "-" + $record.php + "-" +
-                 $record.profile + "-" + $record.flavor + "-" + $record.variant + "-" + $host.architecture),
-               normal_image: ("joomengine-smoke:" + $record.version + "-" + $record.php +
-                 "-standard-" + $record.flavor + "-" + $record.variant + "-" + $host.architecture)}
+               image: "joomengine-smoke:candidate",
+               normal_image: "joomengine-smoke:normal"}
             ]} | if (.include | length) > 0 then . else error("No smoke platforms available") end
           ' "$destination/selected.json")"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -177,7 +200,7 @@ jobs:
           retention-days: 7
 
   image-smoke:
-    name: Image smoke (${{ matrix.version }}, ${{ matrix.profile }}, ${{ matrix.flavor }}, ${{ matrix.variant }}, ${{ matrix.architecture }})
+    name: Image smoke (${{ matrix.target }}, JCB ${{ matrix.version }}, PHP ${{ matrix.php }}, ${{ matrix.profile }}, ${{ matrix.flavor }}, ${{ matrix.variant }}, ${{ matrix.architecture }})
     needs: generate-contexts
     runs-on: ubuntu-latest
     timeout-minutes: 60

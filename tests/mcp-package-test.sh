@@ -86,11 +86,16 @@ printf 'ok - highest stable numeric version wins independently of XML order\n'
 assert_status 0 mcp_package_supports "$resolved" 6.1.3 8.3
 assert_status 0 mcp_package_supports "$resolved" 6.2.0 8.4.1
 assert_status 0 mcp_package_supports "$resolved" 6.10.0 8.10
+assert_status 0 mcp_package_supports "$resolved" 6.2.0-alpha1 8.3
+assert_status 0 mcp_package_supports "$resolved" 6.2.0-beta2 8.3
+assert_status 0 mcp_package_supports "$resolved" 6.2.0-rc1 8.3
 assert_status 1 mcp_package_supports "$resolved" 6.0.99 8.4
 assert_status 1 mcp_package_supports "$resolved" 5.4.9 8.4
 assert_status 1 mcp_package_supports "$resolved" 7.1.0 8.4
+assert_status 1 mcp_package_supports "$resolved" 7.0.0-alpha1 8.4
 assert_status 1 mcp_package_supports "$resolved" 6.1.3 8.2.99
 assert_status 2 mcp_package_supports "$resolved" 6.x 8.4
+assert_status 2 mcp_package_supports "$resolved" 6.2.0-preview1 8.4
 assert_status 2 mcp_package_supports "$resolved" 6.1.3 8.x
 assert_status 2 mcp_package_supports '{}' 6.1.3 8.4
 assert_status 2 mcp_package_supports '{"php_minimum":"8.3.0","target_platform":"["}' 6.1.3 8.4
@@ -152,6 +157,8 @@ update 1.0.0 stable "$HASH_A" 8.3.0 '(5|6|7)\.' | fixture
 future="$(mcp_resolve_package "$TEST_TMP/updates.xml")"
 assert_status 1 mcp_package_supports "$future" 5.4.0 8.3
 assert_status 0 mcp_package_supports "$future" 7.0.0 8.3
+assert_status 0 mcp_package_supports "$future" 7.0.0-alpha1 8.3
+assert_status 1 mcp_package_supports "$future" 5.4.0-rc1 8.3
 printf 'ok - future Joomla eligibility follows metadata above the Joomla 6 floor\n'
 
 # Stub only curl, and verify that both success and failure clean the fetched XML.

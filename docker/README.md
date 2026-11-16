@@ -1,9 +1,9 @@
 # Run Joomla Component Builder
 
 JoomEngine extends the official Joomla image, bundles verified JCB packages, and
-lets Joomla perform automatic installation. The default `latest` image includes
-the official Joomla development environment. Add `-mcp` to select an image with
-the MCP component and its console/webservices plugins.
+lets Joomla perform automatic installation. The default `latest` image uses the
+normal official Joomla environment. Add `-mcp` for the MCP component and its
+console/webservices plugins, then `-dev` when development tools are wanted.
 
 ## Start a local environment
 
@@ -22,31 +22,34 @@ volumes when recreating or switching containers.
 
 ## Choose the environment
 
-`latest` and `latest-mcp` follow the configured default profile, currently `dev`.
-Use explicit aliases when a deployment must stay on one profile:
+The four latest aliases select the environment explicitly:
 
+- `latest`: JCB on the normal Joomla image.
+- `latest-mcp`: JCB and MCP on the normal Joomla image.
 - `latest-dev`: JCB with development tools.
-- `latest-dev-mcp`: JCB and MCP with development tools.
-- `latest-standard`: JCB on the normal Joomla image.
-- `latest-standard-mcp`: JCB and MCP on the normal Joomla image.
+- `latest-mcp-dev`: JCB and MCP with development tools.
 
 Versioned tags retain their existing normal-image meaning. Their development
-counterparts add `-dev`, before the optional MCP suffix. For example,
-`6.2.0-php8.4-apache` and `6.2.0-php8.4-apache-dev` have the same JCB version,
+counterparts add `-dev` after the optional MCP suffix. For example,
+`6.2.0-php8.5-apache` and `6.2.0-php8.5-apache-dev` have the same JCB version,
 configured Joomla base version, PHP version, and runtime; only the profile differs.
-The leading version in every tag is JCB's version.
+The MCP development counterpart is `6.2.0-php8.5-apache-mcp-dev`. Every development
+tag ends in `-dev`. The leading version in every tag is JCB's version.
+
+Joomla 6 images are configured for PHP 8.3, 8.4, and 8.5. Latest aliases and
+version shorthands select PHP 8.5; explicit PHP 8.3 and 8.4 tags remain available.
 
 Use the example Compose file's image setting to select a matching normal image:
 
 ```bash
-JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.4-apache \
+JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.5-apache \
   docker compose up -d --no-deps --pull always --force-recreate joomla
 ```
 
 Switch back to its development counterpart with:
 
 ```bash
-JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.4-apache-dev \
+JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.5-apache-dev \
   docker compose up -d --no-deps --pull always --force-recreate joomla
 ```
 
@@ -59,6 +62,32 @@ Changing images does not upgrade Joomla or extensions already installed there.
 All configured runtime variants have normal images. Development tags are currently
 available for the configured Joomla 6 series; Joomla 4 and 5 remain normal-only.
 FPM and FPM-Alpine require a separate web server; the supplied example uses Apache.
+
+### Images built for a specific Joomla release
+
+The maintainer's `conf/versions.json` defines named targets. Each target chooses
+an exact Joomla release and its stable/alpha/beta/RC channel, the JCB major and
+release selector, PHP versions, runtimes, and profiles. JCB selectors can follow
+one release channel or list exact package versions. A target can therefore test
+stable JCB with preview Joomla, or preview JCB with stable Joomla, as an explicitly
+selected experimental combination.
+
+Additional targets use qualified tags with both application versions:
+
+```text
+<jcb-version>-joomla<joomla-version>-php<php>-<runtime>[-mcp][-dev]
+```
+
+The final `-dev` always selects development tools. A Joomla alpha/beta/RC version
+inside a tag selects preview Joomla; it does not itself add development tools.
+Qualified targets never change `latest`, `latest-mcp`, or the ordinary JCB version
+aliases. Choose an exact published tag from the build manifest before deployment.
+
+Stable-following targets automatically advance within their Joomla major once
+all selected official image variants are published. Pinned targets keep the exact
+Joomla version and refresh only its base-image digests. Joomla previews are pinned
+explicitly; disabled future targets do not produce images. See the
+[build-target configuration](../README.md#build-targets) for complete examples.
 
 ## Environment and first installation
 

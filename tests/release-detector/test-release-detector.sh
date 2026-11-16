@@ -661,6 +661,150 @@ test_invalid_profile_matrix_fails_without_mutation() {
 	done
 }
 
+prepare_targets_case() {
+	local case_dir
+	case_dir="$(prepare_case "$1")"
+	cp "$FIXTURES/versions-targets.json" "$case_dir/versions.json"
+	rm "$case_dir/upstream-images.json"
+	# These target/tag fixtures are synthetic; they do not assert publication.
+	jq '[.results[] | select(.name == "6.1.3-php8.3-apache")][0] as $image |
+		{results: [
+			"6.1.3-php8.3-apache", "6.1.3-php8.3-apache-dev",
+			"6.1.4-php8.3-apache", "6.1.4-php8.3-apache-dev",
+			"7.0.0-alpha1-php8.3-apache-dev", "6.2.0-beta1-php8.3-apache-dev",
+			"6.2.0-rc1-php8.3-apache-dev"
+		] | map(. as $name | $image | .name = $name)}' \
+		"$FIXTURES/docker-tags-current.json" > "$case_dir/docker-tags.json"
+	printf '%s\n' "$case_dir"
+}
+
+test_target_updates_preserve_shared_pinned_bases() {
+	local case_dir
+	case_dir="$(prepare_targets_case shared-target-base)"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/docker-tags.json" "$case_dir/github-output"
+	assert_json_value "$case_dir/versions.json" '.["joomla6-stable"].joomla' 6.1.4
+	assert_json_value "$case_dir/versions.json" '.["joomla6-pinned"].joomla' 6.1.3
+	assert_json_value "$case_dir/versions.json" '.["joomla6-stable"].jcb.versions' latest-stable
+	assert_json_value "$case_dir/versions.json" '.["joomla6-pinned"].jcb.versions | join(",")' 6.2.0
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.3-php8.3-apache")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.3-php8.3-apache-dev")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.4-php8.3-apache-dev")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | length' 7
+	assert_file_contains "$case_dir/github-output" 'updated_targets=joomla6-stable'
+	assert_file_contains "$case_dir/github-output" 'updated_majors=6'
+	assert_file_contains "$case_dir/github-output" 'waiting_targets='
+	# Existing preview records must pass validation and remain stable next time.
+	cp "$case_dir/upstream-images.json" "$case_dir/state.before"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/docker-tags.json" "$case_dir/second-output"
+	cmp -s "$case_dir/state.before" "$case_dir/upstream-images.json" || fail "pinned preview state churned"
+	assert_file_contains "$case_dir/second-output" 'changed=no'
+}
+
+test_named_target_readiness_outputs() {
+	local case_dir
+	case_dir="$(prepare_targets_case pending-named-target)"
+	jq '.results |= map(select(.name != "6.1.4-php8.3-apache-dev"))' \
+		"$case_dir/docker-tags.json" > "$case_dir/pending-tags.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/pending-tags.json" "$case_dir/github-output"
+	assert_json_value "$case_dir/versions.json" '.["joomla6-stable"].joomla' 6.1.3
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.4-php8.3-apache")' false
+	assert_file_contains "$case_dir/github-output" 'waiting_targets=joomla6-stable'
+	assert_file_contains "$case_dir/github-output" 'waiting_majors=6'
+	assert_file_contains "$case_dir/github-output" 'updated_targets='
+}
+
+test_pinned_channels_ignore_stable_release_updates() {
+	local case_dir
+	case_dir="$(prepare_targets_case pinned-channels)"
+	jq 'with_entries(.value.update = "pinned")' "$case_dir/versions.json" > "$case_dir/versions.next"
+	mv "$case_dir/versions.next" "$case_dir/versions.json"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	printf '%s\n' '{"branches":[{"branch":"Joomla! 6","version":"6.2.0"},{"branch":"Joomla! 7","version":"7.0.0"}]}' \
+		> "$case_dir/stable-releases.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$case_dir/stable-releases.json" "$case_dir/docker-tags.json" "$case_dir/github-output"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "stable feed promoted a pinned channel"
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("7.0.0-alpha1-php8.3-apache-dev")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.2.0-beta1-php8.3-apache-dev")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.2.0-rc1-php8.3-apache-dev")' true
+	assert_file_contains "$case_dir/github-output" 'updated_targets='
+	# A release feed is not an input to an all-pinned target set.
+	printf '%s\n' '{"not":"a release feed"}' > "$case_dir/stable-releases.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$case_dir/stable-releases.json" "$case_dir/docker-tags.json" "$case_dir/second-output"
+	assert_file_contains "$case_dir/second-output" 'changed=no'
+	jq '(.results[] | select(.name == "7.0.0-alpha1-php8.3-apache-dev")).digest =
+		"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+		"$case_dir/docker-tags.json" > "$case_dir/drift-tags.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$case_dir/stable-releases.json" "$case_dir/drift-tags.json" "$case_dir/drift-output"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "preview digest drift changed target pin"
+	assert_json_value "$case_dir/upstream-images.json" '.tags["7.0.0-alpha1-php8.3-apache-dev"].index_digest' \
+		sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	assert_file_contains "$case_dir/drift-output" 'digests_changed=yes'
+}
+
+test_joomla_target_major_is_independent_of_jcb_major() {
+	local case_dir
+	case_dir="$(prepare_targets_case joomla-seven-jcb-six)"
+	jq '{"joomla7-stable": (.["joomla7-alpha"] |
+		.joomla = "7.0.0" | .channel = "stable" | .update = "stable")}' \
+		"$case_dir/versions.json" > "$case_dir/versions.next"
+	mv "$case_dir/versions.next" "$case_dir/versions.json"
+	jq '.results[0] as $image | {results: ["7.0.0-php8.3-apache-dev", "7.0.1-php8.3-apache-dev"] |
+		map(. as $name | $image | .name = $name)}' \
+		"$case_dir/docker-tags.json" > "$case_dir/seven-tags.json"
+	printf '%s\n' '{"branches":[{"branch":"Joomla! 6","version":"6.9.0"},{"branch":"Joomla! 7","version":"7.0.1"}]}' \
+		> "$case_dir/releases.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$case_dir/releases.json" "$case_dir/seven-tags.json" "$case_dir/github-output"
+	assert_json_value "$case_dir/versions.json" '.["joomla7-stable"].joomla' 7.0.1
+	assert_json_value "$case_dir/versions.json" '.["joomla7-stable"].jcb.major' 6
+	assert_json_value "$case_dir/upstream-images.json" '.tags | keys | join(",")' 7.0.1-php8.3-apache-dev
+	assert_file_contains "$case_dir/github-output" 'updated_targets=joomla7-stable'
+	assert_file_contains "$case_dir/github-output" 'updated_majors=7'
+}
+
+test_unavailable_preview_fails_without_mutation() {
+	local case_dir
+	case_dir="$(prepare_targets_case unavailable-preview)"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-current.json" "$case_dir/docker-tags.json" "$case_dir/initial-output"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	cp "$case_dir/upstream-images.json" "$case_dir/state.before"
+	jq '.results |= map(select(.name != "7.0.0-alpha1-php8.3-apache-dev"))' \
+		"$case_dir/docker-tags.json" > "$case_dir/missing-tags.json"
+	if run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/missing-tags.json" "$case_dir/github-output" \
+		> "$case_dir/stdout" 2> "$case_dir/stderr"; then
+		fail "unpublished active preview was accepted"
+	fi
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "missing preview changed target versions"
+	cmp -s "$case_dir/state.before" "$case_dir/upstream-images.json" || fail "missing preview changed state"
+	[[ ! -e "$case_dir/github-output" ]] || fail "missing preview emitted success outputs"
+	grep -Fq '7.0.0-alpha1-php8.3-apache-dev' "$case_dir/stderr" || fail "missing preview diagnostic omitted tag"
+}
+
+test_disabled_preview_does_not_block_active_targets() {
+	local case_dir
+	case_dir="$(prepare_targets_case disabled-preview)"
+	jq '.["joomla7-alpha"].enabled = false' "$case_dir/versions.json" > "$case_dir/versions.next"
+	mv "$case_dir/versions.next" "$case_dir/versions.json"
+	jq '.results |= map(select(.name != "7.0.0-alpha1-php8.3-apache-dev"))' \
+		"$case_dir/docker-tags.json" > "$case_dir/active-tags.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/active-tags.json" "$case_dir/github-output"
+	assert_json_value "$case_dir/versions.json" '.["joomla7-alpha"].enabled' false
+	assert_json_value "$case_dir/versions.json" '.["joomla7-alpha"].joomla' 7.0.0-alpha1
+	assert_json_value "$case_dir/versions.json" '.["joomla6-stable"].joomla' 6.1.4
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("7.0.0-alpha1-php8.3-apache-dev")' false
+	assert_file_contains "$case_dir/github-output" 'updated_targets=joomla6-stable'
+	assert_file_contains "$case_dir/github-output" 'waiting_targets='
+}
+
 test_no_change
 echo "ok - current versions and digests are a byte-for-byte no-op"
 test_all_candidate_tags_ready
@@ -707,4 +851,16 @@ test_missing_current_dev_image_fails_without_mutation
 echo "ok - a missing configured development tag fails without mutation"
 test_invalid_profile_matrix_fails_without_mutation
 echo "ok - empty, duplicate and unknown profiles fail without mutation"
+test_target_updates_preserve_shared_pinned_bases
+echo "ok - independent targets retain shared pinned bases when a stable target advances"
+test_named_target_readiness_outputs
+echo "ok - named targets report readiness separately from compatibility major outputs"
+test_pinned_channels_ignore_stable_release_updates
+echo "ok - pinned alpha, beta and RC targets never promote through the stable feed"
+test_joomla_target_major_is_independent_of_jcb_major
+echo "ok - a Joomla 7 target mapped to JCB 6 polls Joomla 7 releases"
+test_unavailable_preview_fails_without_mutation
+echo "ok - unavailable active previews fail without changing targets or digest state"
+test_disabled_preview_does_not_block_active_targets
+echo "ok - disabled preview targets remain configured without blocking active releases"
 bash "$TEST_DIR/test-registry.sh"
