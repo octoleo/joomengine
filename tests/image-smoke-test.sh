@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Exercise a real first deployment and restart of a freshly built Apache image.
-# Usage: tests/image-smoke-test.sh IMAGE standard|mcp
+# Exercise first deployment, restart, and an optional dev-to-normal image switch.
+# Usage: tests/image-smoke-test.sh IMAGE standard|mcp [standard|dev [NORMAL_IMAGE]]
 set -euo pipefail
 
-if [[ $# -ne 2 || ( "$2" != standard && "$2" != mcp ) ]]; then
-    echo "Usage: $0 IMAGE standard|mcp" >&2
+if [[ $# -lt 2 || $# -gt 4 || ( "$2" != standard && "$2" != mcp ) ]]; then
+    echo "Usage: $0 IMAGE standard|mcp [standard|dev [NORMAL_IMAGE]]" >&2
     exit 2
 fi
 
 image="$1"
 flavor="$2"
+profile="${3:-standard}"
+normal_image="${4:-}"
+if [[ "$profile" != standard && "$profile" != dev ]] ||
+    [[ -n "$normal_image" && "$profile" != dev ]]; then
+    echo 'The profile must be standard or dev; a normal counterpart requires dev.' >&2
+    exit 2
+fi
 timeout_seconds="${JOOMENGINE_SMOKE_TIMEOUT_SECONDS:-900}"
 if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
     echo 'JOOMENGINE_SMOKE_TIMEOUT_SECONDS must be a positive integer.' >&2
@@ -26,6 +33,7 @@ test_id="joomengine-smoke-${BASHPID}-${RANDOM}"
 network="$test_id"
 database="${test_id}-db"
 application="${test_id}-app"
+volume="${test_id}-site"
 # These disposable credentials are limited to the isolated test network. No
 # database ports are published, and all containers and volumes are removed.
 database_password="smoke-${RANDOM}-${RANDOM}-database"
@@ -42,6 +50,7 @@ cleanup() {
         docker logs --tail 100 "$database" >&2
     fi
     docker rm --force --volumes "$application" "$database" >/dev/null 2>&1
+    docker volume rm "$volume" >/dev/null 2>&1
     docker network rm "$network" >/dev/null 2>&1
     exit "$status"
 }
@@ -132,7 +141,43 @@ extension_snapshot() {
         "SELECT extension_id,type,element,folder,enabled,package_id,manifest_cache FROM joom_extensions WHERE element IN ('com_componentbuilder','pkg_joomengine_mcp','com_joomengine_mcp','joomengine_mcp') ORDER BY extension_id;"
 }
 
+verify_cli() {
+    local commands major
+    commands="$(docker exec "$application" php cli/joomla.php list --raw)"
+    major="$(docker exec "$application" sh -c 'printf "%s" "${JOOMLA_VERSION%%.*}"')"
+    # Historical Joomla 4 packages retain their upstream console capabilities.
+    if [[ "$major" -ge 5 ]]; then
+        grep -q '^componentbuilder:' <<< "$commands" ||
+            fail 'The installed JCB console commands must be available'
+    fi
+}
+
+verify_profile() {
+    local expected="$1"
+    docker exec --env "SMOKE_PROFILE=$expected" "$application" php -r '
+        $expected = getenv("SMOKE_PROFILE") === "dev";
+        exit(extension_loaded("xdebug") === $expected ? 0 : 1);
+    ' || fail "Xdebug presence does not match the $expected profile"
+}
+
+start_application() {
+    local selected_image="$1"
+    docker run --detach --name "$application" --network "$network" \
+        --platform linux/amd64 --publish 127.0.0.1::80 \
+        --mount "type=volume,src=$volume,dst=/var/www/html" \
+        --env JOOMLA_DB_HOST=database --env JOOMLA_DB_USER=joomengine \
+        --env JOOMLA_DB_NAME=joomengine --env JOOMLA_DB_PREFIX=joom_ \
+        --env "JOOMLA_DB_PASSWORD=$database_password" \
+        --env JOOMLA_SITE_NAME='JoomEngine deployment smoke test' \
+        --env JOOMLA_ADMIN_USER='Smoke Test Administrator' \
+        --env JOOMLA_ADMIN_USERNAME=smokeadmin \
+        --env JOOMLA_ADMIN_PASSWORD='Disposable-Smoke-Password-2026!' \
+        --env JOOMLA_ADMIN_EMAIL=smoke@example.com \
+        "$selected_image" >/dev/null
+}
+
 docker network create "$network" >/dev/null
+docker volume create "$volume" >/dev/null
 docker run --detach --name "$database" --network "$network" --network-alias database \
     --env "MARIADB_ROOT_PASSWORD=$root_password" \
     --env MARIADB_DATABASE=joomengine --env MARIADB_USER=joomengine \
@@ -146,30 +191,22 @@ until docker exec "$database" healthcheck.sh --connect --innodb_initialized >/de
     sleep 2
 done
 
-echo "Starting $flavor first deployment..."
-docker run --detach --name "$application" --network "$network" \
-    --platform linux/amd64 --publish 127.0.0.1::80 \
-    --env JOOMLA_DB_HOST=database --env JOOMLA_DB_USER=joomengine \
-    --env JOOMLA_DB_NAME=joomengine --env JOOMLA_DB_PREFIX=joom_ \
-    --env "JOOMLA_DB_PASSWORD=$database_password" \
-    --env JOOMLA_SITE_NAME='JoomEngine deployment smoke test' \
-    --env JOOMLA_ADMIN_USER='Smoke Test Administrator' \
-    --env JOOMLA_ADMIN_USERNAME=smokeadmin \
-    --env JOOMLA_ADMIN_PASSWORD='Disposable-Smoke-Password-2026!' \
-    --env JOOMLA_ADMIN_EMAIL=smoke@example.com \
-    "$image" >/dev/null
+echo "Starting $profile $flavor first deployment..."
+start_application "$image"
 
 wait_for_http 'first deployment'
 verify_extensions
+verify_cli
+verify_profile "$profile"
 before_restart="$(extension_snapshot)"
 
 # Make the original installation inputs unusable after success. A restart
 # must run the installed site and must not invoke either package installer
 # again. This checks observable behavior without relying on marker names.
 docker exec "$application" sh -eu -c '
-    printf "This archive must never be installed again.\n" > /usr/src/joomengine/jcb.zip
-    if [ -f /usr/src/joomengine/mcp.zip ]; then
-        printf "This archive must never be installed again.\n" > /usr/src/joomengine/mcp.zip
+    printf "This archive must never be installed again.\n" > "$JCB_INSTALL_DIR/jcb.zip"
+    if [ -f "$JCB_INSTALL_DIR/mcp.zip" ]; then
+        printf "This archive must never be installed again.\n" > "$JCB_INSTALL_DIR/mcp.zip"
     fi
 '
 echo "Starting $flavor restart after successful first deployment..."
@@ -179,4 +216,16 @@ verify_extensions
 [[ "$(extension_snapshot)" == "$before_restart" ]] ||
     fail 'Extension registration or installed versions changed during restart'
 
-echo "PASS: $flavor first deployment, extension registration and restart without reinstall"
+if [[ -n "$normal_image" ]]; then
+    echo "Switching the installed $flavor site from dev to normal..."
+    docker rm --force "$application" >/dev/null
+    start_application "$normal_image"
+    wait_for_http 'normal image switch'
+    verify_extensions
+    verify_cli
+    verify_profile standard
+    [[ "$(extension_snapshot)" == "$before_restart" ]] ||
+        fail 'Extension registration or installed versions changed when switching profiles'
+fi
+
+echo "PASS: $profile $flavor deployment, console, restart and requested profile switch"

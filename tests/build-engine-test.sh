@@ -104,13 +104,6 @@ if [[ "${JOOMENGINE_BUILD_TEST_MOCK:-no}" == "yes" ]]; then
 		printf '%s\n' \
 			"${jcb_major}.0.0|${jcb_url}|stable|$(printf 'a%.0s' {1..128})"
 		;;
-	gawk)
-		printf 'FROM joomla:%s-php%s-%s@%s\n' \
-			"$JOOMLA_VERSION" "$PHP_VERSION" "$VARIANT" "$BASE_IMAGE_INDEX_DIGEST"
-		if [[ "$IMAGE_FLAVOR" == "mcp" ]]; then
-			jq -r '"ENV MCP_VERSION=" + .version, "ENV MCP_SHA512=" + .sha512' <<< "$IMAGE_MCP_METADATA"
-		fi
-		;;
 	docker)
 		printf '%s\n' "$*" >> "$JOOMENGINE_DOCKER_TRACE"
 		case "${1:-} ${2:-} ${3:-}" in
@@ -212,18 +205,17 @@ fi
 CASE_DIR="$TEST_TMP/repository"
 mkdir -p \
 	"$CASE_DIR/bin" \
-	"$CASE_DIR/bashbrew" \
 	"$CASE_DIR/conf" \
 	"$CASE_DIR/images/jcb6.0.0/j6.0.0/php8.4/apache" \
 	"$CASE_DIR/log" \
 	"$CASE_DIR/src/bin" \
 	"$CASE_DIR/src/lib" \
-	"$CASE_DIR/src/docker"
+	"$CASE_DIR/src/lib"
 
 cp "$ENGINE" "$CASE_DIR/src/bin/joomengine.sh"
 cp "$REPO_ROOT/src/lib/mcp-package.sh" "$CASE_DIR/src/lib/mcp-package.sh"
-cp "$REPO_ROOT/src/docker/Dockerfile.template" "$CASE_DIR/src/docker/Dockerfile.template"
-cp "$REPO_ROOT/src/docker/docker-entrypoint.sh" "$CASE_DIR/src/docker/docker-entrypoint.sh"
+cp "$REPO_ROOT/src/lib/image-config.sh" "$CASE_DIR/src/lib/image-config.sh"
+cp "$REPO_ROOT/conf/build.json" "$CASE_DIR/conf/build.json"
 cat > "$CASE_DIR/src/bin/check-joomla-releases.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -240,6 +232,7 @@ while [[ $# -gt 0 ]]; do
 	--refresh-current) refresh_current=yes; shift ;;
 	--versions-file) versions_file="$2"; shift 2 ;;
 	--state-file) state_file="$2"; shift 2 ;;
+	--config-file) shift 2 ;;
 	*) echo "unexpected refresh argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -252,10 +245,9 @@ else
 fi
 SH
 chmod +x "$CASE_DIR/src/bin/check-joomla-releases.sh"
-printf '# deterministic jq template fixture\n' > "$CASE_DIR/bashbrew/jq-template.awk"
 printf 'obsolete context\n' > "$CASE_DIR/images/jcb6.0.0/j6.0.0/php8.4/apache/obsolete"
 printf 'https://example.test/com_componentbuilder.zip\n' > "$CASE_DIR/jcb-url"
-printf '[]\n' > "$CASE_DIR/conf/maintainers.json"
+cp "$REPO_ROOT/conf/maintainers.json" "$CASE_DIR/conf/maintainers.json"
 printf 'obsolete build record\n' > "$CASE_DIR/conf/hashes.txt"
 export JOOMENGINE_MCP_XML_FILE="$CASE_DIR/mcp-update.xml"
 export JOOMENGINE_MCP_FETCH_TRACE="$CASE_DIR/mcp-fetch.trace"
@@ -302,7 +294,7 @@ cat > "$CASE_DIR/conf/upstream-images.json" <<'JSON'
 }
 JSON
 
-for mock_name in curl xmlstarlet gawk docker; do
+for mock_name in curl xmlstarlet docker; do
 	make_stub "$mock_name"
 done
 
@@ -342,7 +334,6 @@ run_engine_args() {
 	JOOMENGINE_REGISTRY_TAG_DIGEST="${JOOMENGINE_REGISTRY_TAG_DIGEST:-}" \
 	JOOMENGINE_FAIL_ALIAS_CREATE="${JOOMENGINE_FAIL_ALIAS_CREATE:-no}" \
 	JOOMENGINE_REGISTRY_RETRY_DELAY_SECONDS=0 \
-	BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 	DOCKER_DEFAULT_PLATFORM="${JOOMENGINE_TEST_DEFAULT_PLATFORM:-linux/amd64}" \
 	PATH="$CASE_DIR/bin:$PATH" \
 		"$ENGINE_UNDER_TEST" "$@" > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"; then
@@ -382,7 +373,7 @@ jq -s -e '
 	([.[] | select(.flavor == "standard") | .tags[] + "-mcp"] | sort) == ([.[] | select(.flavor == "mcp") | .tags[]] | sort)
 ' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'MCP image tags or provenance are missing, duplicated, or mixed into plain images'
 assert_not_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache/Dockerfile" 'MCP_VERSION'
-assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-mcp/Dockerfile" 'MCP_VERSION=1.0.1'
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-mcp/Dockerfile" 'MCP_VERSION="1.0.1"'
 echo 'ok - local auto mode loads one host image pinned to the verified index digest'
 
 first_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
@@ -473,18 +464,19 @@ assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp 
 [[ "$(awk '$11 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$plain_hash" ]] || fail 'MCP helper change altered the standard image fingerprint'
 echo 'ok - resolver changes invalidate MCP fingerprints without changing plain images'
 
-printf '# entrypoint change\n' >> "$CASE_DIR/src/docker/docker-entrypoint.sh"
+jq '.environment.JOOMLA_SITE_NAME = "Configured development site"' "$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
+mv "$CASE_DIR/conf/build.next" "$CASE_DIR/conf/build.json"
 run_engine
 assert_contains "$TRACE_FILE" 'buildx build --pull'
-entrypoint_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
-[[ "$entrypoint_hashes" != "$first_hashes" ]] || fail 'entrypoint change did not advance hash state'
-echo 'ok - an entrypoint change rebuilds the affected image'
+configuration_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
+[[ "$configuration_hashes" != "$first_hashes" ]] || fail 'JSON environment change did not advance hash state'
+echo 'ok - a JSON environment change rebuilds the affected image'
 
 printf 'https://cdn.example.test/com_componentbuilder.zip\n' > "$CASE_DIR/jcb-url"
 run_engine
 assert_contains "$TRACE_FILE" 'buildx build --pull'
 release_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
-[[ "$release_hashes" != "$entrypoint_hashes" ]] || fail 'JCB release metadata change did not advance hash state'
+[[ "$release_hashes" != "$configuration_hashes" ]] || fail 'JCB release metadata change did not advance hash state'
 echo 'ok - JCB release metadata changes rebuild the affected image'
 
 jq '.tags["6.1.3-php8.4-apache"].index_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
@@ -515,12 +507,11 @@ platform_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
 [[ "$platform_hashes" != "$child_hashes" ]] || fail 'platform list change did not advance hash state'
 echo 'ok - upstream platform-set changes rebuild the affected image'
 
-printf '# template dry-run change\n' >> "$CASE_DIR/src/docker/Dockerfile.template"
+printf '# template dry-run change\n' >> "$CASE_DIR/src/lib/image-config.sh"
 : > "$TRACE_FILE"
 JOOMENGINE_BUILD_TEST_MOCK=yes \
 JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
-BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 DOCKER_DEFAULT_PLATFORM=linux/amd64 \
 PATH="$CASE_DIR/bin:$PATH" \
 	"$ENGINE_UNDER_TEST" --dry-run > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"
@@ -533,7 +524,6 @@ if JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_FAIL_DOCKER_BUILD=yes \
 JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
-BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 DOCKER_DEFAULT_PLATFORM=linux/amd64 \
 PATH="$CASE_DIR/bin:$PATH" \
 		"$ENGINE_UNDER_TEST" --build-only > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"; then
@@ -575,7 +565,6 @@ if JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_BUILDER_PLATFORMS='linux/amd64*' \
 	JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 	JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
-	BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 	PATH="$CASE_DIR/bin:$PATH" \
 		"$ENGINE_UNDER_TEST" --force > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"; then
 	fail 'unsupported Buildx platform set returned success'
@@ -633,7 +622,7 @@ jq -e '
 published_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
 echo 'ok - default publication pushes the exact automatic platform set before manifest aliases'
 
-printf '# explicit subset change\n' >> "$CASE_DIR/src/docker/Dockerfile.template"
+printf '# explicit subset change\n' >> "$CASE_DIR/src/lib/image-config.sh"
 JOOMENGINE_INSPECT_PLATFORMS='linux/amd64,linux/arm64/v8' \
 	run_engine_args --platforms linux/amd64,linux/arm64/v8
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/amd64,linux/arm64/v8 --tag octoleo/joomengine:6.0.0-php8.4-apache --metadata-file'
@@ -650,7 +639,7 @@ echo 'ok - explicit publication subsets are validated, pushed, and recorded'
 jq '.tags["6.1.3-php8.4-apache"].platforms["linux/arm/v7"] = "sha256:6666666666666666666666666666666666666666666666666666666666666666"' \
 	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
 mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
-printf '# single-platform registry change\n' >> "$CASE_DIR/src/docker/Dockerfile.template"
+printf '# single-platform registry change\n' >> "$CASE_DIR/src/lib/image-config.sh"
 JOOMENGINE_INSPECT_SINGLE_PLATFORM=linux/arm \
 	run_engine_args --platforms linux/arm/v7
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/arm/v7 --tag octoleo/joomengine:6.0.0-php8.4-apache --metadata-file'
@@ -665,7 +654,6 @@ echo 'ok - single-manifest publication normalizes implicit ARM v7 configuration'
 if JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 	JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
-	BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 	PATH="$CASE_DIR/bin:$PATH" \
 		"$ENGINE_UNDER_TEST" --platforms linux/s390x > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"; then
 	fail 'platform absent from the upstream base returned success'
@@ -679,7 +667,6 @@ echo 'ok - an explicit platform must be a subset of every selected base image'
 if JOOMENGINE_BUILD_TEST_MOCK=yes \
 	JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" \
 	JOOMENGINE_JCB_URL_FILE="$CASE_DIR/jcb-url" \
-	BASHBREW_SCRIPTS="$CASE_DIR/bashbrew" \
 	PATH="$CASE_DIR/bin:$PATH" \
 		"$ENGINE_UNDER_TEST" --build-only --platforms linux/amd64,linux/arm64/v8 > "$CASE_DIR/engine.out" 2> "$CASE_DIR/engine.err"; then
 	fail 'multi-platform local load returned success'
@@ -688,7 +675,7 @@ fi
 assert_contains "$CASE_DIR/engine.err" '--build-only can load exactly one explicit platform'
 echo 'ok - local build-only rejects illegal multi-platform loads'
 
-printf '# explicit local platform change\n' >> "$CASE_DIR/src/docker/Dockerfile.template"
+printf '# explicit local platform change\n' >> "$CASE_DIR/src/lib/image-config.sh"
 run_engine_args --build-only --platforms linux/arm64/v8
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/arm64/v8 --tag octoleo/joomengine:6.0.0-php8.4-apache --load'
 assert_contains "$TRACE_FILE" 'tag octoleo/joomengine:6.0.0-php8.4-apache octoleo/joomengine:latest'
@@ -812,6 +799,9 @@ echo 'ok - mixed PHP and Apache/FPM variants receive only eligible, uniquely suf
 
 cp "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/versions.matrix"
 cp "$CASE_DIR/conf/upstream-images.json" "$CASE_DIR/conf/upstream-images.matrix"
+jq '.sources.jcb_updates["7"] = "https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads/7.x/componentbuilder_update_server.xml"' \
+    "$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
+mv "$CASE_DIR/conf/build.next" "$CASE_DIR/conf/build.json"
 jq '."7" = {php: ["8.4"], joomla: "7.1.3", variants: ["apache"]}' \
 	"$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
 mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
@@ -826,6 +816,79 @@ jq -s -e '
 mv "$CASE_DIR/conf/versions.matrix" "$CASE_DIR/conf/versions.json"
 mv "$CASE_DIR/conf/upstream-images.matrix" "$CASE_DIR/conf/upstream-images.json"
 echo 'ok - latest-mcp independently tracks the newest compatible stable image'
+
+# Development tools are an independent profile, not another web-server variant.
+# Keep the former explicit tags on standard images and promote only the default
+# aliases to the configured development profile.
+cp "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/versions.before-profiles"
+cp "$CASE_DIR/conf/upstream-images.json" "$CASE_DIR/conf/upstream-images.before-profiles"
+cp "$CASE_DIR/conf/build.json" "$CASE_DIR/conf/build.before-profiles"
+cp "$CASE_DIR/conf/hashes.txt" "$CASE_DIR/conf/hashes.before-profiles"
+jq '."6".php = ["8.4"] | ."6".profiles = ["standard", "dev"]' \
+	"$CASE_DIR/conf/versions.json" > "$CASE_DIR/conf/versions.next"
+mv "$CASE_DIR/conf/versions.next" "$CASE_DIR/conf/versions.json"
+jq '.tags += (.tags | to_entries | map(select(.key | contains("php8.4")) |
+	.key += "-dev" | .value.index_digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd") | from_entries)' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+printf '# stale generated adapter\n' > "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache/docker-entrypoint.sh"
+run_engine
+jq -se '
+	length == 12 and
+	([.[] | .tags[]] | length) == ([.[] | .tags[]] | unique | length) and
+	all(.[] | select(.profile == "dev");
+		. as $record |
+		(.base_image | contains("-dev@sha256:dddd")) and
+		(.context | contains($record.variant + "-dev"))) and
+	([.[] | select(.latest == "yes")] | length == 1 and .[0].profile == "dev" and .[0].variant == "apache") and
+	([.[] | select(.latest_mcp == "yes")] | length == 1 and .[0].profile == "dev" and .[0].flavor == "mcp") and
+	([.[] | select(.tags | index("6.0.0"))] | length == 1 and .[0].profile == "standard") and
+	([.[] | select(.tags | index("6.0.0-dev"))] | length == 1 and .[0].profile == "dev") and
+	([.[] | select(.tags | index("latest-standard"))] | length == 1 and .[0].profile == "standard") and
+	([.[] | select(.tags | index("latest-standard-mcp"))] | length == 1 and .[0].profile == "standard" and .[0].flavor == "mcp") and
+	([.[] | select(.tags | index("latest-dev"))] | length == 1 and .[0].profile == "dev") and
+	([.[] | select(.tags | index("latest-dev-mcp"))] | length == 1 and .[0].profile == "dev" and .[0].flavor == "mcp")
+' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'profile-specific tags or default aliases are incorrect'
+[[ ! -e "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache/docker-entrypoint.sh" ]] || fail 'stale downstream entrypoint survived regeneration'
+while IFS= read -r context; do
+	if grep -Eq '^(ENTRYPOINT|CMD|COPY docker-entrypoint\.sh)[[:space:]]' "$CASE_DIR/images/$context/Dockerfile"; then
+		fail 'generated image replaces the inherited startup metadata'
+	fi
+done < <(jq -r '.context' "$CASE_DIR/conf/manifest.ndjson")
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-dev/Dockerfile" \
+	'ENV JOOMLA_EXTENSIONS_PATHS="/usr/src/joomengine/jcb.zip"'
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-dev-mcp/Dockerfile" \
+	'ENV JOOMLA_EXTENSIONS_PATHS="/usr/src/joomengine/jcb.zip;/usr/src/joomengine/mcp.zip"'
+assert_contains "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-dev/Dockerfile" \
+	'ENV JOOMLA_SITE_NAME="Configured development site"'
+echo 'ok - JSON profiles generate inherited normal/dev runtimes and independent MCP tags'
+
+run_engine
+[[ ! -s "$TRACE_FILE" ]] || fail 'unchanged profile matrix invoked Docker'
+standard_profile_hashes="$(awk '$13 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")"
+jq '.tags["6.1.3-php8.4-apache-dev"].index_digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+run_engine
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'one dev base digest change rebuilt unrelated profiles or runtimes'
+assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-dev --load'
+assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-dev-mcp --load'
+[[ "$(awk '$13 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$standard_profile_hashes" ]] || fail 'dev refresh changed standard image fingerprints'
+echo 'ok - development base digest updates rebuild only the corresponding profile and flavors'
+
+jq '.defaultProfile = "standard"' "$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
+mv "$CASE_DIR/conf/build.next" "$CASE_DIR/conf/build.json"
+run_engine_args --dry-run
+jq -se '
+	([.[] | select(.latest == "yes")] | length == 1 and .[0].profile == "standard") and
+	([.[] | select(.latest_mcp == "yes")] | length == 1 and .[0].profile == "standard") and
+	([.[] | select(.tags | index("latest-dev"))] | length == 1 and .[0].profile == "dev")
+' "$CASE_DIR/conf/manifest.ndjson" >/dev/null || fail 'JSON defaultProfile failed to select normal defaults while preserving explicit dev aliases'
+echo 'ok - the JSON default profile controls latest aliases without removing explicit choices'
+mv "$CASE_DIR/conf/versions.before-profiles" "$CASE_DIR/conf/versions.json"
+mv "$CASE_DIR/conf/upstream-images.before-profiles" "$CASE_DIR/conf/upstream-images.json"
+mv "$CASE_DIR/conf/build.before-profiles" "$CASE_DIR/conf/build.json"
+mv "$CASE_DIR/conf/hashes.before-profiles" "$CASE_DIR/conf/hashes.txt"
 
 for incompatible_joomla in 6.0.5 7.1.3 5.4.3; do
 	jq --arg joomla "$incompatible_joomla" '."6".joomla = $joomla' \

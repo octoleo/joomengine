@@ -33,6 +33,17 @@ assert_json() {
 	jq -e "$expression" <<< "$json" >/dev/null || fail "metadata does not satisfy $expression"
 }
 
+# Package sources belong to JSON; explicit deployment/build overrides still win.
+printf '%s\n' '{"sources":{"mcp_updates_url":"https://example.test/configured.xml"}}' > "$TEST_TMP/build.json"
+assert_status 0 mcp_update_url "$TEST_TMP/build.json"
+[[ "$(< "$TEST_TMP/output")" == 'https://example.test/configured.xml' ]] || fail 'JSON update URL was not selected'
+MCP_UPDATE_URL='https://example.test/override.xml' assert_status 0 mcp_update_url "$TEST_TMP/build.json"
+[[ "$(< "$TEST_TMP/output")" == 'https://example.test/override.xml' ]] || fail 'explicit update URL did not override JSON'
+MCP_UPDATE_URL='http://example.test/unsafe.xml' assert_status 2 mcp_update_url "$TEST_TMP/build.json"
+printf '%s\n' '{"sources":{}}' > "$TEST_TMP/invalid-build.json"
+assert_status 2 mcp_update_url "$TEST_TMP/invalid-build.json"
+printf 'ok - update URL comes from JSON with a validated explicit override\n'
+
 HASH_A="$(printf 'a%.0s' {1..128})"
 HASH_B="$(printf 'b%.0s' {1..128})"
 

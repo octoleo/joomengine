@@ -165,6 +165,18 @@
 				"linux/s390x": "sha256:d979944ac930448c0f75f017151b2f4594ad740d81597395403515afe77aab26"
 			}
 		},
+		"6.2.0-php8.3-apache-dev": {
+			"index_digest": "sha256:872b05c5f682e8013a677af8a029e31e11a01825d4cdcb14cdf5d4aba7d4b25a",
+			"platforms": {
+				"linux/386": "sha256:4fffdee2e51cb6ebb82b8d5c465b153e3e2023aeb4920c2fa2486aad5314384d",
+				"linux/amd64": "sha256:b3c96640298b1a3d0f2a0ec0ef307039184b57c8d25c52a2cdad6a12d2a13659",
+				"linux/arm/v5": "sha256:e35c909ee64d53df9c302c59fb40061bd2894460c2217f21cbdcc4950a67acec",
+				"linux/arm/v7": "sha256:7ad8de3eb1ead2b77b981780885350c8f3577a96828e23c6cb67649a24758cae",
+				"linux/arm64/v8": "sha256:e77e952518b75d457b474244be78b56ef005207bdd05eb0db7d5a09cc6569f4f",
+				"linux/ppc64le": "sha256:4cc6bdc47610f78c7fc0c5d2a7b9b4eb3c773b381a26c846cb7200d07cb82d1f",
+				"linux/s390x": "sha256:757f18e93a98aa2c543c593b618376bf8175bb589d18f0bd5d9050af0c4d29e8"
+			}
+		},
 		"6.2.0-php8.3-fpm": {
 			"index_digest": "sha256:ec6ecec5349915a049f8b106463139790ba68c365210df7cb6804e424462686b",
 			"platforms": {
@@ -191,6 +203,30 @@
 				"linux/s390x": "sha256:c6f0e4a62ac4b10f5a751e261d700150d3f7c78c4125d4f72bd3894dfb098334"
 			}
 		},
+		"6.2.0-php8.3-fpm-alpine-dev": {
+			"index_digest": "sha256:05dc17b05ae54542422ae79e5fc0277175d19d70f176458f2497b45cdd52fd5d",
+			"platforms": {
+				"linux/386": "sha256:db0f9aba6937b72dc0b2b0dce95ec02204c387f59bc0aa8a031e26a44f2951b8",
+				"linux/amd64": "sha256:c119367a9e7ccb980554ee4a3faf72b8ade5502e0dd6ce9293aa823929b4d629",
+				"linux/arm/v6": "sha256:62c63dfec7da189e51c2a3e1dfd5171b33a5f4b235658674d8aeff02998fab88",
+				"linux/arm/v7": "sha256:e1add08c3af7ec2270b3d4eace376ded3fe607d45794780dcd649c8af59d310a",
+				"linux/arm64/v8": "sha256:15e6c6ffe5e7a21c9ccb135fbbe0dedf9dfadae7750c2a1bc1d52ef251c3e3c9",
+				"linux/ppc64le": "sha256:e52bdea5591eb64f151b7f08c029f0804f4740f1af78d056319f4be7cb0716d2",
+				"linux/s390x": "sha256:ca81e3886429d4fdebe7a38fb8cf0d5d2ee649c6f70301ed501c1f2eb8a3c62a"
+			}
+		},
+		"6.2.0-php8.3-fpm-dev": {
+			"index_digest": "sha256:c65b8fca55969ef58a4125d1d5303bbaa725ac6e89dcd2b879a663cc086ad0eb",
+			"platforms": {
+				"linux/386": "sha256:c455441a54e25c5ad830d0ca2f81c13647e419be0d4e37e86545acf3524fad7f",
+				"linux/amd64": "sha256:5f62d450549860bcdadaf08861c1c2174655ffc8eea23091ac980b370fecd696",
+				"linux/arm/v5": "sha256:39a7e74c850ffe064194c4d4146956143dffd8aac086d26220c2fd5af909a142",
+				"linux/arm/v7": "sha256:9953c162a4bde61fdaf1b3f610899c45bf9f5f412ea6c0324e36f53f8c06e85a",
+				"linux/arm64/v8": "sha256:03deff12414ccdf8dac12096b172cfa4edbda1d4b5145b739a3576dccb8b2df6",
+				"linux/ppc64le": "sha256:1878edb27304632b2173a1407f7fdbf691d3a486909cbe506bddf7193efccc91",
+				"linux/s390x": "sha256:9245b6af51c741d28d5883faf2d132f40545617e04ab075d5de4c8455777edf9"
+			}
+		},
 		"6.2.0-php8.4-apache": {
 			"index_digest": "sha256:90860f32e987dd3bace7ad1127f1b80a5b834835f012d598ed96f24308d99883",
 			"platforms": {
@@ -202,6 +238,18 @@
 				"linux/ppc64le": "sha256:f8a5b2584df9cc76b435140ea0807beda0eaa219c9d963fd416f456946bbebba",
 				"linux/riscv64": "sha256:41610e1e8961fa20fae12ae0939486a1bc04e13ddbdcf6d8127140ad110f20a0",
 				"linux/s390x": "sha256:b0bdc26bd0f9c8928ffdd75600ea2d0e89f5428bc9cecdd5afd34811c90dc8bd"
+			}
+		},
+		"6.2.0-php8.4-apache-dev": {
+			"index_digest": "sha256:3e7bc45c484c652864a88b6e796931444da4cbeac451a4a3410f826446950dcc",
+			"platforms": {
+				"linux/386": "sha256:146d526da34532988596d21bdfbcf38a28a5d28ab4812c67b8d3c376b3c2ba4e",
+				"linux/amd64": "sha256:65796cfab95b57d0510f593ee7e9f275d2a9ddc3b39e8a6d39293e406f286dd3",
+				"linux/arm/v5": "sha256:4eeb2c7a54fdc8460be74d8e1dc6dad6b41e5ac7b0661db4265f3985aa68d863",
+				"linux/arm/v7": "sha256:5c4c454c7e4de466f23dc56cbb760dcb83c7e1787d090a00984e281f7ac4bb8f",
+				"linux/arm64/v8": "sha256:ca73d8c16816c14dc10ced2c20b455bf812bb00a0a597dea4a3900ed14161c07",
+				"linux/ppc64le": "sha256:2975e8edebca76e2e1fe086c688fa340499e7a535cd241c31d9c57e47ec98e9f",
+				"linux/s390x": "sha256:2aa643284f1833e174f03ca4c98556f9d667707636ad43eb7be84a4e79a0eb6a"
 			}
 		},
 		"6.2.0-php8.4-fpm": {
@@ -228,6 +276,30 @@
 				"linux/ppc64le": "sha256:29af1ad4dc31343f895b3fddaa9afde06ef5579ce0e163f99d1ae29878136a2e",
 				"linux/riscv64": "sha256:9b20556b00e4ee807c940ef71e88590322faa39d4d6be76fc9ffca2da4bbdb28",
 				"linux/s390x": "sha256:8bb11109e27b2e40446b98fa5ad76c542e8fbd372557b9028e9a12efb9c2c252"
+			}
+		},
+		"6.2.0-php8.4-fpm-alpine-dev": {
+			"index_digest": "sha256:08fca7f70f724ed42e0d3da422a0184764a45a1ce47b0187ab60bb98ad9d8f85",
+			"platforms": {
+				"linux/386": "sha256:90abbc5dfb63af131ee6e2d123083c7a9ee80f5a3e5fe8a530fd856a68dfe343",
+				"linux/amd64": "sha256:254938ded738c1d8ca6acba7b5b38e70bf778700c67ffe7985d1e92576798a15",
+				"linux/arm/v6": "sha256:266e229512f4f61cd985abd531a1df1bfca0e9537fb7e854d9a0f0eeaaac9408",
+				"linux/arm/v7": "sha256:18a02bd1f8dfa142963a47bc7a16383712dc3dd264b0efefe81e87b469b714c9",
+				"linux/arm64/v8": "sha256:a1f26a6bff0b47031e6a13c30d344525b3c01fba33d37e194a66a5d2577ddb59",
+				"linux/ppc64le": "sha256:23db3c202cf877c31a2482f3975db64784cbb564958e346ec3e4a70f71433ec7",
+				"linux/s390x": "sha256:125702f2ea82418a5d0cef8016e9e62d80afba739d0b0901f0c4b17c9b2be2f5"
+			}
+		},
+		"6.2.0-php8.4-fpm-dev": {
+			"index_digest": "sha256:20bcc0236c0131016a2833eec46289b1e4bc3c26fa92d63d16b31423e15db9a9",
+			"platforms": {
+				"linux/386": "sha256:31dabe0e74f3065add4925f5cf877c0b4b20459bb02c6136cec69331b81649d6",
+				"linux/amd64": "sha256:b46bbabcd903e520ead94c989d5da94220c951ac647437340871e95259cc629f",
+				"linux/arm/v5": "sha256:0c4b421c25552e55a725e75b90ddde5eb2aa850b86e0e1fba117cd74b630dd88",
+				"linux/arm/v7": "sha256:bbc3a04842ec4cb2f105b80811ca8e95f44b607b701e7fe7fbd666c16e0de78f",
+				"linux/arm64/v8": "sha256:d3eb2cc95d1403f3ed37c22332ee78bbde909f7043b28773517283fd49d20b78",
+				"linux/ppc64le": "sha256:c444a1adfe785d8a5c6e3d41d21c42143d58d209389a642cee9c4b0fef7a8efb",
+				"linux/s390x": "sha256:60764d8b266aec89142e5fc70f2fd65db415681db65e0f7ebbd5a86c08230f74"
 			}
 		}
 	}

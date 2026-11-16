@@ -22,7 +22,6 @@ jobs:
     name: Static checks and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -32,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq shellcheck xmlstarlet gawk
+          sudo apt-get install -y jq shellcheck xmlstarlet
 
       - name: Validate shell scripts
         shell: bash
@@ -54,17 +53,13 @@ jobs:
             jq -e . "$json_file" >/dev/null
           done < <(
             find conf tests/release-detector/fixtures \
-              -type f \
-              -name '*.json' \
-              -print0 | sort -z
+              -type f -name '*.json' -print0 | sort -z
           )
           jq -e . conf/manifest.ndjson >/dev/null
 
       - name: Run deterministic unit tests
         shell: bash
-        run: |
-          set -euo pipefail
-          ./tests/run.sh
+        run: ./tests/run.sh
 
       - name: Lint GitHub Actions workflows
         env:
@@ -74,12 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/actionlint.tar.gz"
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 3 \
+          curl --fail --silent --show-error --location --retry 3 \
             --output "$archive" \
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
@@ -87,10 +77,12 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
 
   generate-contexts:
-    name: Generate smoke contexts from current templates
+    name: Generate smoke contexts from JSON configuration
     needs: static-and-unit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -100,48 +92,81 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq xmlstarlet gawk
+          sudo apt-get install -y jq xmlstarlet
 
       - name: Generate without building or publishing
         shell: bash
-        run: |
-          set -euo pipefail
-          src/bin/joomengine.sh --dry-run --force
+        run: src/bin/joomengine.sh --dry-run --force
 
-      - name: Select standard and MCP contexts
+      - name: Select configured profiles, variants, and available platforms
+        id: select
         shell: bash
         run: |
           set -euo pipefail
           destination=quality-contexts
           mkdir -p "$destination/images"
-          : > "$destination/manifest.ndjson"
+          jq -sc '
+            . as $all |
+            [group_by(.flavor)[] |
+              ([.[] | select(.latest == "yes" or .latest_mcp == "yes")] | first) //
+              ([.[] | select(.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] |
+                sort_by([(.version | split(".") | map(tonumber)),
+                         (.php | split(".") | map(tonumber))]) | last) |
+              select(. != null)
+            ] as $anchors |
+            [$anchors[] as $anchor | $all[] |
+              select(.version == $anchor.version and .joomla == $anchor.joomla and
+                .php == $anchor.php and .flavor == $anchor.flavor)] as $current |
+            # Also exercise the oldest active series with a normal Apache base.
+            [$all[] | select(.flavor == "standard" and .profile == "standard" and
+              .variant == "apache" and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))] |
+            sort_by(.major | tonumber) |
+            (if length == 0 then [] else
+              .[0].major as $oldest |
+              [.[] | select(.major == $oldest)] |
+              sort_by([(.version | split(".") | map(tonumber)),
+                       (.php | split(".") | map(tonumber))]) | [last]
+            end) as $historical |
+            ($current + $historical) | unique_by(.context) |
+            if length > 0 then . else error("No configured smoke contexts") end
+          ' conf/manifest.ndjson > "$destination/selected.json"
 
-          for flavor in standard mcp; do
-            anchor="$(
-              jq -scer --arg flavor "$flavor" '
-                [.[] | select(.flavor == $flavor and
-                  (if $flavor == "mcp" then .latest_mcp else .latest end) == "yes")]
-                | if length == 1 then .[0] else error("Missing or ambiguous latest " + $flavor) end
-              ' conf/manifest.ndjson
-            )"
-            for variant in apache fpm fpm-alpine; do
-              record="$(
-                jq -scer --argjson anchor "$anchor" --arg variant "$variant" '
-                  [.[] | select(.version == $anchor.version and .joomla == $anchor.joomla and
-                    .php == $anchor.php and .flavor == $anchor.flavor and .variant == $variant)]
-                  | if length == 1 then .[0] else error("Missing or ambiguous context") end
-                ' conf/manifest.ndjson
-              )"
-              context="$(jq -er '.context' <<< "$record")"
-              test -f "images/$context/Dockerfile"
-              test -f "images/$context/docker-entrypoint.sh"
-              mkdir -p "$destination/images/$context"
-              cp "images/$context/Dockerfile" "images/$context/docker-entrypoint.sh" \
-                "$destination/images/$context/"
-              printf '%s\n' "$record" >> "$destination/manifest.ndjson"
-            done
-          done
-          jq -se 'length == 6' "$destination/manifest.ndjson" >/dev/null
+          while IFS= read -r context; do
+            test -f "images/$context/Dockerfile"
+            test ! -e "images/$context/docker-entrypoint.sh"
+            if grep -Eq '^(ENTRYPOINT|CMD|COPY)[[:space:]]' "images/$context/Dockerfile"; then
+              echo "Generated images must inherit Joomla startup without runtime scripts." >&2
+              exit 1
+            fi
+            mkdir -p "$destination/images/$context"
+            cp "images/$context/Dockerfile" "$destination/images/$context/"
+          done < <(jq -r '.[].context' "$destination/selected.json")
+
+          matrix="$(jq -c '
+            . as $selected |
+            {include: [
+              .[] as $record |
+              (if $record.base_platforms["linux/amd64"] != null then
+                 {platform: "linux/amd64", architecture: "amd64"} else empty end,
+               if $record.variant == "apache" and
+                  $record.base_platforms["linux/arm64/v8"] != null then
+                 {platform: "linux/arm64/v8", architecture: "arm64"} else empty end) as $host |
+              ([$selected[] | select(.profile == "standard" and
+                 .version == $record.version and .joomla == $record.joomla and
+                 .php == $record.php and .variant == $record.variant and
+                 .flavor == $record.flavor and
+                 .base_platforms[$host.platform] != null)][0].context // "") as $normal |
+              {profile: $record.profile, flavor: $record.flavor,
+               variant: $record.variant, version: $record.version, php: $record.php,
+               context: $record.context, platform: $host.platform,
+               architecture: $host.architecture, normal_context: $normal,
+               image: ("joomengine-smoke:" + $record.version + "-" + $record.php + "-" +
+                 $record.profile + "-" + $record.flavor + "-" + $record.variant + "-" + $host.architecture),
+               normal_image: ("joomengine-smoke:" + $record.version + "-" + $record.php +
+                 "-standard-" + $record.flavor + "-" + $record.variant + "-" + $host.architecture)}
+            ]} | if (.include | length) > 0 then . else error("No smoke platforms available") end
+          ' "$destination/selected.json")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       - name: Share the exact generated build inputs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -152,27 +177,13 @@ jobs:
           retention-days: 7
 
   image-smoke:
-    name: Image smoke (${{ matrix.flavor }}, ${{ matrix.variant }}, ${{ matrix.platform }})
+    name: Image smoke (${{ matrix.version }}, ${{ matrix.profile }}, ${{ matrix.flavor }}, ${{ matrix.variant }}, ${{ matrix.architecture }})
     needs: generate-contexts
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        flavor: [standard, mcp]
-        variant: [apache, fpm, fpm-alpine]
-        platform: [linux/amd64]
-        architecture: [amd64]
-        include:
-          - flavor: standard
-            variant: apache
-            platform: linux/arm64/v8
-            architecture: arm64
-          - flavor: mcp
-            variant: apache
-            platform: linux/arm64/v8
-            architecture: arm64
-
+      matrix: ${{ fromJSON(needs.generate-contexts.outputs.matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -192,68 +203,82 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - name: Install context-selection tooling
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: Select representative image context
-        id: context
+      - name: Build representative image
         env:
-          VARIANT: ${{ matrix.variant }}
-          FLAVOR: ${{ matrix.flavor }}
+          CONTEXT: ${{ matrix.context }}
+          IMAGE: ${{ matrix.image }}
           PLATFORM: ${{ matrix.platform }}
         shell: bash
         run: |
           set -euo pipefail
-          record="$(
-            jq -scer --arg flavor "$FLAVOR" --arg variant "$VARIANT" '
-              [.[] | select(.flavor == $flavor and .variant == $variant)]
-              | if length == 1 then .[0] else error("Missing or ambiguous smoke context") end
-            ' quality-contexts/manifest.ndjson
-          )"
-          jq -e --arg platform "$PLATFORM" '.base_platforms | has($platform)' <<< "$record" >/dev/null
-          context="$(jq -er '.context' <<< "$record")"
-          test -f "quality-contexts/images/$context/Dockerfile"
-          echo "path=quality-contexts/images/$context" >> "$GITHUB_OUTPUT"
-          echo "image=joomengine-smoke:$FLAVOR-$VARIANT-${{ matrix.architecture }}" >> "$GITHUB_OUTPUT"
+          docker buildx build --load --platform "$PLATFORM" --pull \
+            --tag "$IMAGE" "quality-contexts/images/$CONTEXT"
 
-      - name: Build representative image
+      - name: Build normal counterpart for volume-switch test
+        if: matrix.profile == 'dev' && matrix.variant == 'apache' && matrix.architecture == 'amd64' && matrix.normal_context != ''
+        env:
+          CONTEXT: ${{ matrix.normal_context }}
+          IMAGE: ${{ matrix.normal_image }}
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx build \
-            --load \
-            --platform "${{ matrix.platform }}" \
-            --pull \
-            --tag "${{ steps.context.outputs.image }}" \
-            "${{ steps.context.outputs.path }}"
+          docker buildx build --load --platform linux/amd64 --pull \
+            --tag "$IMAGE" "quality-contexts/images/$CONTEXT"
 
-      - name: Validate packaged entrypoint and verified archives
+      - name: Validate inherited startup, verified packages, and profile tools
         env:
           FLAVOR: ${{ matrix.flavor }}
+          PROFILE: ${{ matrix.profile }}
+          VARIANT: ${{ matrix.variant }}
+          IMAGE: ${{ matrix.image }}
+          PLATFORM: ${{ matrix.platform }}
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm \
-            --platform "${{ matrix.platform }}" \
-            --entrypoint bash \
-            --env "SMOKE_FLAVOR=$FLAVOR" \
-            "${{ steps.context.outputs.image }}" -euc '
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/entrypoint.sh"]'
+          expected_command='["php-fpm"]'
+          [[ "$VARIANT" != apache ]] || expected_command='["apache2-foreground"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE")" = "$expected_command"
+          docker run --rm --platform "$PLATFORM" --entrypoint bash \
+            --env "SMOKE_FLAVOR=$FLAVOR" --env "SMOKE_PROFILE=$PROFILE" \
+            "$IMAGE" -euc '
               bash -n /entrypoint.sh
-              printf "%s  %s\n" "$JCB_SHA512" /usr/src/joomengine/jcb.zip | sha512sum -c -
+              if [[ "$SMOKE_PROFILE" == dev ]]; then
+                php --ri xdebug >/dev/null
+                php --ri pcntl >/dev/null
+                php --ri sockets >/dev/null
+                composer --version
+                node --version
+                npm --version
+                npx --version
+                for tool in git ssh patch zip unzip rsync jq python3 make g++; do
+                  command -v "$tool" >/dev/null
+                done
+              else
+                php -r "exit(extension_loaded(\"xdebug\") ? 1 : 0);"
+              fi
+              printf "%s  %s\n" "$JCB_SHA512" "$JCB_INSTALL_DIR/jcb.zip" | sha512sum -c -
               if [[ "$SMOKE_FLAVOR" == mcp ]]; then
                 test -n "$MCP_VERSION"
-                printf "%s  %s\n" "$MCP_SHA512" /usr/src/joomengine/mcp.zip | sha512sum -c -
+                printf "%s  %s\n" "$MCP_SHA512" "$JCB_INSTALL_DIR/mcp.zip" | sha512sum -c -
               else
-                test ! -e /usr/src/joomengine/mcp.zip
+                test ! -e "$JCB_INSTALL_DIR/mcp.zip"
                 test -z "${MCP_VERSION:-}${MCP_SHA512:-}${MCP_PACKAGE:-}"
               fi
             '
 
-      - name: Verify first deployment and restart against MariaDB
+      - name: Verify first deployment, restart, and available profile switch
         if: matrix.variant == 'apache' && matrix.architecture == 'amd64'
+        env:
+          IMAGE: ${{ matrix.image }}
+          FLAVOR: ${{ matrix.flavor }}
+          PROFILE: ${{ matrix.profile }}
+          NORMAL_CONTEXT: ${{ matrix.normal_context }}
+          NORMAL_IMAGE: ${{ matrix.normal_image }}
         shell: bash
-        run: tests/image-smoke-test.sh "${{ steps.context.outputs.image }}" "${{ matrix.flavor }}"
+        run: |
+          args=("$IMAGE" "$FLAVOR" "$PROFILE")
+          if [[ "$PROFILE" == dev && -n "$NORMAL_CONTEXT" ]]; then
+            args+=("$NORMAL_IMAGE")
+          fi
+          tests/image-smoke-test.sh "${args[@]}"

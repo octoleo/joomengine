@@ -10,6 +10,7 @@ url=""
 authorization=""
 accept=""
 fail_http="no"
+registry_base="https://registry-1.docker.io/v2/${MOCK_REGISTRY_REPOSITORY:-library/joomla}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--output|-o) output="$2"; shift 2 ;;
@@ -46,7 +47,7 @@ case "$url" in
 		fi
 		[[ ! -f "$MOCK_REGISTRY_DIR/token.status" ]] || http_status="$(cat "$MOCK_REGISTRY_DIR/token.status")"
 		;;
-	https://registry-1.docker.io/v2/library/joomla/manifests/*)
+	"$registry_base"/manifests/*)
 		[[ "$authorization" == "Authorization: Bearer registry-test-token" ]] || {
 			echo "Missing registry authorization" >&2; exit 90;
 		}
@@ -73,7 +74,14 @@ case "$url" in
 			printf '\r\n' >> "$headers"
 		fi
 		;;
-	*) echo "Unexpected network request in registry test: $url" >&2; exit 90 ;;
+	*)
+		if [[ -n "${MOCK_RELEASES_URL:-}" && "$url" == "$MOCK_RELEASES_URL" ]]; then
+			cp "$MOCK_REGISTRY_DIR/releases.json" "$output"
+		else
+			echo "Unexpected network request in registry test: $url" >&2
+			exit 90
+		fi
+		;;
 esac
 
 [[ -z "$write_out" ]] || printf '%s' "$http_status"

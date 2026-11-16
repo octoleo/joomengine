@@ -50,15 +50,28 @@ EOF
 		$standard, ($standard | select(.major == "6") |
 			.flavor = "mcp" | .mcp = $package | .mcp_input_sha = ("f" * 64))
 	' "$TEST_TMP/versions.json" > "$TEST_TMP/manifest.ndjson"
-	jq -r '[.version, .php, .joomla, .variant, .jcb_sha, .release_input_sha,
-		.build_input_sha, .base_index_digest, .base_platform_state_sha,
-		(.platforms | join(",")), .flavor, .mcp_input_sha] | join(" ")' \
+	write_hashes
+}
+
+write_hashes() {
+	jq -r '. as $record |
+		([.version, .php, .joomla, .variant, .jcb_sha, .release_input_sha,
+			.build_input_sha, .base_index_digest, .base_platform_state_sha,
+			(.platforms | join(",")), .flavor, .mcp_input_sha] +
+			(if $record | has("profile") then [$record.profile] else [] end)) | join(" ")' \
 		"$TEST_TMP/manifest.ndjson" > "$TEST_TMP/hashes.txt"
 }
 
 rewrite_manifest() {
 	jq -c "$1" "$TEST_TMP/manifest.ndjson" > "$TEST_TMP/manifest.next"
 	mv "$TEST_TMP/manifest.next" "$TEST_TMP/manifest.ndjson"
+}
+
+enable_dev_profiles() {
+	jq '."6".profiles = ["standard", "dev"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+	mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+	rewrite_manifest '.profile = "standard" | ., (select(.major == "6") | .profile = "dev")'
+	write_hashes
 }
 
 run_detector() {
@@ -86,6 +99,33 @@ assert_changed() {
 
 reset_case
 assert_changed no 'published compatible MCP counterparts do not rebuild'
+
+reset_case
+enable_dev_profiles
+assert_changed no 'published standard and dev MCP counterparts are checked independently'
+
+reset_case
+enable_dev_profiles
+rewrite_manifest 'select(.flavor != "mcp" or .profile != "dev" or .php != "8.4" or .variant != "fpm")'
+assert_changed yes 'a missing dev MCP counterpart requests publishing'
+
+reset_case
+enable_dev_profiles
+awk '$13 != "dev"' "$TEST_TMP/hashes.txt" > "$TEST_TMP/hashes.next"
+mv "$TEST_TMP/hashes.next" "$TEST_TMP/hashes.txt"
+assert_changed yes 'dev manifest rows without published dev fingerprints request publishing'
+
+reset_case
+enable_dev_profiles
+rewrite_manifest 'if .flavor == "mcp" and .profile == "dev" then .mcp.version = "0.9.0" else . end'
+assert_changed yes 'stale dev package metadata is not hidden by current standard images'
+
+reset_case
+enable_dev_profiles
+jq '."6".profiles = ["standard"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+rewrite_manifest 'if .flavor == "mcp" and .profile == "dev" then .mcp.version = "0.9.0" else . end'
+assert_changed no 'removed profiles do not trigger repeated publishing from obsolete manifest rows'
 
 reset_case
 rewrite_manifest 'select(.flavor != "mcp" or .php != "8.4" or .variant != "fpm")'
@@ -153,3 +193,48 @@ run_detector || fail 'missing initial build state failed'
 grep -Fxq 'changed=yes' "$TEST_TMP/output" || fail 'missing build state did not request publishing'
 [[ ! -e "$TEST_TMP/manifest.ndjson" && ! -e "$TEST_TMP/hashes.txt" ]] || fail 'poll created build state'
 printf 'ok - missing build state requests publishing without creating files\n'
+
+reset_case
+jq '."6".profiles = ["unknown"]' "$TEST_TMP/versions.json" > "$TEST_TMP/versions.next"
+mv "$TEST_TMP/versions.next" "$TEST_TMP/versions.json"
+if run_detector; then
+	fail 'unknown profile unexpectedly succeeded'
+fi
+[[ ! -s "$TEST_TMP/output" ]] || fail 'unknown profile emitted success outputs'
+printf 'ok - unknown matrix profiles fail before package resolution\n'
+
+# Verify the detector passes the JSON source URL to the shared fetcher.
+reset_case
+mkdir "$TEST_TMP/mock-bin"
+cat > "$TEST_TMP/mock-bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=''
+url=''
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--output) output="$2"; shift 2 ;;
+		https://*) url="$1"; shift ;;
+		*) shift ;;
+	esac
+done
+[[ -n "$output" && -n "$url" ]]
+printf '%s\n' "$url" > "$MCP_TEST_REQUESTED_URL"
+cp "$MCP_TEST_XML" "$output"
+EOF
+chmod +x "$TEST_TMP/mock-bin/curl"
+jq '.sources.mcp_updates_url = "https://example.test/configured-mcp.xml"' \
+	"$REPO_ROOT/conf/build.json" > "$TEST_TMP/build.json"
+: > "$TEST_TMP/output"
+if ! env -u MCP_UPDATE_URL PATH="$TEST_TMP/mock-bin:$PATH" \
+	MCP_TEST_REQUESTED_URL="$TEST_TMP/requested-url" MCP_TEST_XML="$TEST_TMP/update.xml" \
+	GITHUB_OUTPUT="$TEST_TMP/output" "$DETECTOR" --config-file "$TEST_TMP/build.json" \
+	--versions-file "$TEST_TMP/versions.json" --manifest-file "$TEST_TMP/manifest.ndjson" \
+	--hashes-file "$TEST_TMP/hashes.txt" > "$TEST_TMP/log" 2>&1; then
+	cat "$TEST_TMP/log" >&2
+	fail 'JSON-configured MCP source failed'
+fi
+[[ "$(< "$TEST_TMP/requested-url")" == 'https://example.test/configured-mcp.xml' ]] || \
+	fail 'detector ignored the JSON source URL'
+grep -Fxq 'changed=no' "$TEST_TMP/output" || fail 'configured source caused an unnecessary rebuild'
+printf 'ok - MCP detector fetches its source from the selected JSON configuration\n'

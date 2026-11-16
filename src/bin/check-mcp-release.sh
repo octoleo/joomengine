@@ -9,10 +9,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/../lib/mcp-package.sh"
 
 VERSIONS_FILE="$REPO_ROOT/conf/versions.json"
+BUILD_CONFIG_FILE="$REPO_ROOT/conf/build.json"
 MANIFEST_FILE="$REPO_ROOT/conf/manifest.ndjson"
 HASHES_FILE="$REPO_ROOT/conf/hashes.txt"
 XML_FILE=""
-MCP_UPDATE_URL="${MCP_UPDATE_URL:-https://raw.githubusercontent.com/joomengine/mcp_package/refs/heads/main/.github/joomengine_mcp_update_server.xml}"
 
 fail() {
 	printf '[ERROR] %s\n' "$*" >&2
@@ -24,6 +24,7 @@ show_help() {
 Usage: check-mcp-release.sh [options]
 
   --xml-file PATH       Read MCP update metadata locally instead of downloading it
+  --config-file PATH    Read image profiles and package sources from JSON
   --versions-file PATH Read the configured Joomla/PHP/image-variant matrix
   --manifest-file PATH Read generated image metadata
   --hashes-file PATH   Read successfully published build fingerprints
@@ -37,10 +38,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		--xml-file|--versions-file|--manifest-file|--hashes-file)
+		--xml-file|--config-file|--versions-file|--manifest-file|--hashes-file)
 			[[ $# -ge 2 && -n "$2" ]] || fail "$1 requires a path"
 			case "$1" in
 				--xml-file) XML_FILE="$2" ;;
+				--config-file) BUILD_CONFIG_FILE="$2" ;;
 				--versions-file) VERSIONS_FILE="$2" ;;
 				--manifest-file) MANIFEST_FILE="$2" ;;
 				--hashes-file) HASHES_FILE="$2" ;;
@@ -56,7 +58,11 @@ for command_name in jq grep; do
 	command -v "$command_name" >/dev/null 2>&1 || fail "Missing required command: $command_name"
 done
 [[ -f "$VERSIONS_FILE" && -r "$VERSIONS_FILE" ]] || fail "Cannot read versions file: $VERSIONS_FILE"
-if ! jq -e '
+[[ -f "$BUILD_CONFIG_FILE" && -r "$BUILD_CONFIG_FILE" ]] || fail "Cannot read image configuration: $BUILD_CONFIG_FILE"
+if ! jq -e '.profiles | type == "object" and length > 0' "$BUILD_CONFIG_FILE" >/dev/null; then
+	fail "Invalid image profiles: $BUILD_CONFIG_FILE"
+fi
+if ! jq -e --slurpfile build "$BUILD_CONFIG_FILE" '
 	type == "object" and length > 0 and
 	all(to_entries[];
 		.key as $major |
@@ -66,7 +72,10 @@ if ! jq -e '
 		(.value.php | type == "array" and length > 0 and
 			all(.[]; type == "string" and test("^[0-9]+\\.[0-9]+$"))) and
 		(.value.variants | type == "array" and length > 0 and
-			all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))))
+			all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))) and
+		((.value.profiles // ["standard"]) | type == "array" and length > 0 and
+			length == (unique | length) and
+			all(.[]; type == "string" and $build[0].profiles[.] != null)))
 ' "$VERSIONS_FILE" >/dev/null; then
 	fail "Invalid Joomla build matrix: $VERSIONS_FILE"
 fi
@@ -90,6 +99,7 @@ if ! jq -se '
 		(.major | type == "string" and test("^[0-9]+$")) and
 		(.joomla | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
 		(.php | type == "string" and test("^[0-9]+\\.[0-9]+$")) and
+		((.profile // "standard") | type == "string" and test("^[a-z0-9][a-z0-9._-]*$")) and
 		(.variant | type == "string" and test("^[a-z0-9][a-z0-9._-]*$")))
 ' "$MANIFEST_READ_FILE" >/dev/null; then
 	fail "Invalid image manifest: $MANIFEST_FILE"
@@ -98,7 +108,8 @@ fi
 if [[ -n "$XML_FILE" ]]; then
 	PACKAGE="$(mcp_resolve_package "$XML_FILE")" || fail "Cannot resolve MCP package metadata"
 else
-	PACKAGE="$(mcp_fetch_package "$MCP_UPDATE_URL")" || fail "Cannot fetch MCP package metadata"
+	UPDATE_URL="$(mcp_update_url "$BUILD_CONFIG_FILE")" || fail "Cannot resolve MCP update URL"
+	PACKAGE="$(mcp_fetch_package "$UPDATE_URL")" || fail "Cannot fetch MCP package metadata"
 fi
 MCP_VERSION="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "$PACKAGE")" || \
 	fail "Invalid resolved MCP package version"
@@ -126,16 +137,19 @@ while IFS=$'\t' read -r major joomla php; do
 		continue
 	fi
 	while IFS= read -r version; do
-		while IFS= read -r variant; do
+		while IFS=$'\t' read -r variant profile; do
 			if ! expected_hash="$(jq -ser --arg version "$version" --arg joomla "$joomla" --arg php "$php" \
-				--arg variant "$variant" --argjson package "$PACKAGE" '
+				--arg variant "$variant" --arg profile "$profile" --argjson package "$PACKAGE" '
 				[.[] | select(.flavor == "mcp" and .version == $version and
-					.joomla == $joomla and .php == $php and .variant == $variant)] |
+					.joomla == $joomla and .php == $php and .variant == $variant and
+					(.profile // "standard") == $profile)] |
 				select(length == 1 and .[0].mcp == $package) | .[0] |
 				select(.mcp_input_sha | type == "string" and test("^[a-f0-9]{64}$")) |
-				[.version, .php, .joomla, .variant, .jcb_sha, .release_input_sha,
+				. as $record |
+				([.version, .php, .joomla, .variant, .jcb_sha, .release_input_sha,
 					.build_input_sha, .base_index_digest, .base_platform_state_sha,
-					(.platforms | join(",")), .flavor, .mcp_input_sha] |
+					(.platforms | join(",")), .flavor, .mcp_input_sha] +
+					(if $record | has("profile") then [$record.profile] else [] end)) |
 				select(all(.[]; type == "string" and length > 0)) | join(" ")
 			' "$MANIFEST_READ_FILE")"; then
 				CHANGED="yes"
@@ -144,7 +158,9 @@ while IFS=$'\t' read -r major joomla php; do
 				# successful-build ledger proves that its image actually shipped.
 				CHANGED="yes"
 			fi
-		done < <(jq -r --arg major "$major" '.[$major].variants[]' "$VERSIONS_FILE")
+		done < <(jq -r --arg major "$major" '.[$major] |
+			(.profiles // ["standard"])[] as $profile |
+			.variants[] | [., $profile] | @tsv' "$VERSIONS_FILE")
 	done <<< "$releases"
 done < <(jq -r 'to_entries[] | .key as $major | .value | .joomla as $joomla |
 	.php[] | [$major, $joomla, .] | @tsv' "$VERSIONS_FILE")

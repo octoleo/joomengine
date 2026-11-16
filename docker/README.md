@@ -1,319 +1,191 @@
-# Joomla Component Builder – Official Docker Images
+# Run Joomla Component Builder
 
-These are the **official Docker images for Joomla Component Builder (JCB)**.
+JoomEngine extends the official Joomla image, bundles verified JCB packages, and
+lets Joomla perform automatic installation. The default `latest` image includes
+the official Joomla development environment. Add `-mcp` to select an image with
+the MCP component and its console/webservices plugins.
 
-Each image provides a **ready-to-use Joomla environment** with **Joomla Component Builder automatically installed** and optionally configurable via environment variables and CLI commands.
+## Start a local environment
 
-No manual installation. No guessing. Just run the container.
-
-[https://hub.docker.com/r/octoleo/joomengine](https://hub.docker.com/r/octoleo/joomengine)
-
----
-
-## 🚀 What You Get
-
-- ✅ Joomla (official base image)
-- ✅ Joomla Component Builder (JCB) preloaded in the image
-- ✅ Automatic Joomla + JCB installation on first run
-- ✅ Safe one-time install (idempotent)
-- ✅ Deterministic, fail-fast container startup (`set -euo pipefail`)
-- ✅ Optional extension installation via URL or path
-- ✅ Optional Joomla CLI automation
-- ✅ SMTP configuration support
-- ✅ Web workers run as the configured Apache identity or FPM `www-data`
-- ✅ Unconditional ownership repair after all startup mutations
-
-These images are ideal for:
-
-- Local JCB development
-- CI/CD pipelines
-- Automated component compilation
-- Reproducible Joomla build environments
-
----
-
-## 📦 Available Images
-
-All images are published under:
-```
-octoleo/joomengine
-```
-
-Examples:
-```bash
-docker pull octoleo/joomengine:latest
-docker pull octoleo/joomengine:6.1.3
-docker pull octoleo/joomengine:6.1.3-php8.2-apache
-```
-
-> `latest` always points to the **highest stable JCB release**, Apache variant, using the highest supported PHP version.
-
-Every tag is published as a multi-platform Linux image containing all CPU
-architectures supplied by its selected official Joomla base image. Docker
-automatically pulls the matching architecture for the host, so the commands
-above stay the same on AMD64, ARM64, and the other supported platforms.
-
-### Include the MCP component and plugins
-
-Use the explicit `-mcp` suffix:
+From this directory:
 
 ```bash
-docker pull octoleo/joomengine:6-php8.3-apache-mcp
-docker pull octoleo/joomengine:6-php8.4-fpm-mcp
-docker pull octoleo/joomengine:latest-mcp
+docker compose up -d
 ```
 
-Standard tags, including `latest`, do not bundle MCP. MCP variants are published
-only for Joomla 6+ and PHP versions allowed by the latest stable package's update
-XML. The initial package requires Joomla 6.1+ within 6.x and PHP 8.3.0+. The version
-at the start of an image tag is the JCB version, not the MCP package version.
+Open <http://localhost:8080/administrator/>. The example's administrator is
+`joomengine` with password `joomengine@secure`. These existing development defaults
+can be overridden through the service environment for a deployment.
 
-The package ZIP contains the MCP component, console plugin, and webservices plugin.
-Its URL and SHA-512 are pinned when building the image, and the complete archive
-must pass verification. First deployment installs that local archive after JCB.
-MCP images expose their selected package version and hash in image metadata.
-The `-mcp` tags can move when MCP is updated; pin an image digest for identical
-repeated deployments.
+The example stores Joomla and MariaDB data in named volumes. Do not remove those
+volumes when recreating or switching containers.
 
-Installation is scoped to fresh Joomla bootstrap. If the local MCP ZIP is absent,
-startup skips MCP. A failed MCP installation stops startup and records a pending
-installation in the persistent Joomla tree so the next start retries it. A
-successful installation is recorded and ordinary restarts do not repeat it.
-Changing an image tag on an already configured site does not install or upgrade
-MCP automatically; use Joomla's extension installation/update process for that
-existing site. New volumes receive the package bundled in their selected image.
+## Choose the environment
 
----
+`latest` and `latest-mcp` follow the configured default profile, currently `dev`.
+Use explicit aliases when a deployment must stay on one profile:
 
-## 🧩 How It Works (Runtime Behavior)
+- `latest-dev`: JCB with development tools.
+- `latest-dev-mcp`: JCB and MCP with development tools.
+- `latest-standard`: JCB on the normal Joomla image.
+- `latest-standard-mcp`: JCB and MCP on the normal Joomla image.
 
-When the container starts:
+Versioned tags retain their existing normal-image meaning. Their development
+counterparts add `-dev`, before the optional MCP suffix. For example,
+`6.2.0-php8.4-apache` and `6.2.0-php8.4-apache-dev` have the same JCB version,
+configured Joomla base version, PHP version, and runtime; only the profile differs.
+The leading version in every tag is JCB's version.
 
-1. The **custom Joomla entrypoint** runs with strict error handling
-2. If Joomla is not installed and all required variables are present:
-   * Joomla is **automatically installed**
-   * Database is created/verified
-   * Admin account is configured
-3. Once Joomla is configured (`configuration.php` exists):
-   * Optional extensions are installed from URLs or paths
-   * **Joomla Component Builder is installed automatically**
-   * The bundled **MCP package is installed after JCB**, if present in an MCP image
-   * SMTP configuration is applied (if provided)
-   * Optional Joomla CLI commands are executed
-4. The complete Joomla tree is recursively repaired to the web-worker UID:GID
-5. The upstream Apache/FPM server starts; its request workers run unprivileged
+Use the example Compose file's image setting to select a matching normal image:
 
-This guarantees:
+```bash
+JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.4-apache \
+  docker compose up -d --no-deps --pull always --force-recreate joomla
+```
 
-* ✓ Fails fast on misconfiguration
-* ✓ No silent fallbacks
-* ✓ No race conditions
-* ✓ No repeated installs
-* ✓ No root-owned Joomla files after a successful startup finalizer
-* ✓ Safe for repeated container restarts
+Switch back to its development counterpart with:
 
----
+```bash
+JOOMENGINE_IMAGE=octoleo/joomengine:6.2.0-php8.4-apache-dev \
+  docker compose up -d --no-deps --pull always --force-recreate joomla
+```
 
-## ⚙️ Environment Contract
+Set `JOOMENGINE_IMAGE` in this directory's `.env` file to retain the selection for
+subsequent Compose commands. Keep the database, volumes, environment, and network
+unchanged when switching. A normal image removes the development tools from the
+new container. It does not remove project files or dependencies saved in volumes.
+Changing images does not upgrade Joomla or extensions already installed there.
 
-This image is configured entirely via environment variables. All variables are optional unless stated otherwise.
+All configured runtime variants have normal images. Development tags are currently
+available for the configured Joomla 6 series; Joomla 4 and 5 remain normal-only.
+FPM and FPM-Alpine require a separate web server; the supplied example uses Apache.
 
-The entrypoint runs in **strict mode** (`set -euo pipefail`). Missing or invalid critical values will cause the container to exit early and loudly.
+## Environment and first installation
 
-### Required (Directly or Indirectly)
+Set `JOOMLA_DB_HOST` and either `JOOMLA_DB_PASSWORD` or
+`JOOMLA_DB_PASSWORD_FILE` for automatic deployment. The image supplies these
+defaults from `conf/build.json`:
 
-**Database Connection** - at least one of:
-- `JOOMLA_DB_HOST` - Database hostname (optionally `host:port`)
-- `MYSQL_PORT_3306_TCP` - Legacy Docker link support
+```text
+JOOMLA_DB_USER=joomengine
+JOOMLA_DB_NAME=joomengine
+JOOMLA_SITE_NAME=Joomla Component Builder - JoomEngine
+JOOMLA_ADMIN_USER=JoomEngine Hero
+JOOMLA_ADMIN_USERNAME=joomengine
+JOOMLA_ADMIN_PASSWORD=joomengine@secure
+JOOMLA_ADMIN_EMAIL=joomengine@example.com
+JOOMLA_WEBROOT=/var/www/html
+```
 
-**Database Password** - at least one of:
-- `JOOMLA_DB_PASSWORD` - Direct password
-- `JOOMLA_DB_PASSWORD_FILE` - Path to password file (e.g., Docker secrets)
-- `MYSQL_ENV_MYSQL_ROOT_PASSWORD` - Used when `JOOMLA_DB_USER=root`
-- `JOOMLA_DB_PASSWORD_ALLOW_EMPTY=yes` - Explicitly allow empty password
+Joomla supplies the remaining database defaults, including `mysqli` and the
+`joom_` table prefix. Override site and administrator values in the deployment
+environment. Because the image declares `JOOMLA_ADMIN_PASSWORD`, the modern
+upstream entrypoint rejects also setting `JOOMLA_ADMIN_PASSWORD_FILE`; use a direct
+password override for these default images. A separately built image can omit the
+password declaration when using file-based administrator credentials.
 
-### Core Configuration Defaults
+On a fresh Joomla 5/6 deployment, the inherited entrypoint initializes the database
+and site, installs configured URL packages, installs local packages in their list
+order, applies SMTP settings, and executes configured Joomla console commands.
+Ownership is finalized after initialization. Existing configured sites skip these
+initialization steps on subsequent starts.
 
-| Variable | Default |
-|----------|---------|
-| `JOOMLA_DB_USER` | `joomengine` |
-| `JOOMLA_DB_NAME` | `joomengine` |
-| `JOOMLA_DB_TYPE` | `mysqli` |
-| `JOOMLA_DB_PREFIX` | `joom_` |
-| `JOOMLA_SITE_NAME` | `Joomla Component Builder - JoomEngine` |
-| `JOOMLA_ADMIN_USER` | `JoomEngine Hero` |
-| `JOOMLA_ADMIN_USERNAME` | `joomengine` |
-| `JOOMLA_ADMIN_PASSWORD` | `joomengine@secure` |
-| `JOOMLA_ADMIN_EMAIL` | `joomengine@example.com` |
+If installation fails, Joomla 5/6 retains `.joomla-initializing` in the site volume
+and blocks server startup. Inspect the logs and repair or restore the site and
+database before clearing that marker. There is no downstream automatic MCP retry.
+Historical Joomla 4 images inherit that version's earlier startup behavior;
+they support automatic extension installation but not the current
+`JOOMLA_CLI_COMMANDS` hook or initialization-marker recovery contract.
 
-> The bundled administrator values are development defaults. Always override
-> `JOOMLA_ADMIN_USERNAME`, `JOOMLA_ADMIN_PASSWORD`, and
-> `JOOMLA_ADMIN_EMAIL` with deployment-specific secrets in production.
+## Bundled and additional extensions
 
-### Auto-Deploy Requirements
+The default JCB image declares:
 
-Automatic Joomla installation is performed **only if all** of the following are true:
+```text
+JOOMLA_EXTENSIONS_PATHS=/usr/src/joomengine/jcb.zip
+```
 
-- Joomla is not yet installed
-- The `installation/` directory exists
-- All admin variables are present and valid
-- Validation passes:
-  - `JOOMLA_SITE_NAME` > 2 characters
-  - `JOOMLA_ADMIN_USER` > 2 characters
-  - `JOOMLA_ADMIN_USERNAME` alphabetical only
-  - `JOOMLA_ADMIN_PASSWORD` > 12 characters
-  - `JOOMLA_ADMIN_EMAIL` valid email format
+An MCP image declares:
 
-If any condition fails, the container starts normally without auto-install.
+```text
+JOOMLA_EXTENSIONS_PATHS=/usr/src/joomengine/jcb.zip;/usr/src/joomengine/mcp.zip
+```
 
-### Optional Extension Installation
+These archives are downloaded and SHA-512 verified when building the image.
+First deployment installs JCB followed by MCP. Startup uses those local archives
+and does not resolve new JCB or MCP releases.
 
-Multiple values must be **semicolon-separated** (`;`):
+Docker replaces an environment variable's entire value when it is overridden.
+If you replace `JOOMLA_EXTENSIONS_PATHS`, include the bundled paths in your new
+semicolon-separated list if you still want those packages installed. An empty
+value disables installation through that list; it does not remove the archives
+from the image or uninstall extensions from an existing site.
 
-- `JOOMLA_EXTENSIONS_URLS` - URLs to install after Joomla setup
-- `JOOMLA_EXTENSIONS_PATHS` - Local paths to install after Joomla setup
+`JOOMLA_EXTENSIONS_URLS` provides a separate semicolon-separated list of HTTP(S)
+packages. Joomla processes URL packages before local packages. Packages that need
+JCB already installed should therefore follow JCB in the local path list or be
+installed explicitly after deployment.
 
-⚠️ **URL validation is intentionally strict** (HTTPS/HTTP only, no IPs, no ports in domain).
+## Joomla console and SMTP
 
-### Joomla CLI Automation
+On current Joomla 5/6 bases, `JOOMLA_CLI_COMMANDS` runs semicolon-separated Joomla
+console commands after package installation. Commands are split into
+whitespace-separated arguments without shell evaluation, pipes, or redirects.
+They run once during automatic installation, not on ordinary restarts.
 
-- `JOOMLA_CLI_COMMANDS` - Semicolon-separated Joomla CLI commands
+For example:
 
-Each command is split on whitespace into arguments and passed directly to
-`cli/joomla.php`. No shell evaluation, substitutions, pipes, or redirects are
-performed.
-
-#### Example
 ```yaml
 environment:
   JOOMLA_CLI_COMMANDS: "cache:clean;extension:list --type=component"
 ```
 
-What happens:
+Run commands explicitly on an installed site with:
 
-* Commands run synchronously during the entrypoint bootstrap
-* Executed only after Joomla and JCB are ready
-* Failures stop the container (safe by default)
-* The final recursive ownership repair runs after the last command, including
-  when a command fails
-
-### SMTP Configuration (Optional)
-
-- `JOOMLA_SMTP_HOST` - Format: `hostname` or `hostname:port`
-
-⚠️ **IPv4 only** - IPv6 addresses (e.g., `[::1]:587`) are not supported.
-
-### Execution Guarantees
-
-✓ Fails fast on misconfiguration
-✓ No silent fallbacks
-✓ Deterministic startup behavior
-✓ Safe for repeated container restarts
-✓ Compatible with Apache and PHP-FPM variants
-
----
-
-## 🐳 Example `docker-compose.yml`
-
-### Minimal Setup
-```yaml
-services:
-  joomla:
-    image: octoleo/joomengine:latest
-    ports:
-      - "8080:80"
-    environment:
-      JOOMLA_DB_HOST: mariadb:3306
-      JOOMLA_DB_USER: joomengine
-      JOOMLA_DB_NAME: joomengine
-      JOOMLA_DB_PASSWORD: secure_password12345
-    depends_on:
-      - mariadb
-    volumes:
-      - joomla_data:/var/www/html
-
-  mariadb:
-    image: mariadb:latest
-    environment:
-      MARIADB_USER: joomengine
-      MARIADB_DATABASE: joomengine
-      MARIADB_PASSWORD: secure_password12345
-      MARIADB_ROOT_PASSWORD: your_root_secure_password12345
-    volumes:
-      - mariadb_data:/var/lib/mysql
-
-volumes:
-  joomla_data:
-  mariadb_data:
+```bash
+docker compose exec --user www-data joomla php cli/joomla.php list
+docker compose exec --user www-data joomla php cli/joomla.php extension:list --type=component
 ```
 
-### With JCB CLI Automation
-```yaml
-services:
-  joomla:
-    image: octoleo/joomengine:latest
-    ports:
-      - "8080:80"
-    environment:
-      JOOMLA_DB_HOST: mariadb:3306
-      JOOMLA_DB_USER: joomengine
-      JOOMLA_DB_NAME: joomengine
-      JOOMLA_DB_PASSWORD: secure_password12345
-      JOOMLA_CLI_COMMANDS: "componentbuilder:pull:joomla_component --items=d7e30702-ec49-45ac-8897-0389d61d6da0"
-    depends_on:
-      - mariadb
-    volumes:
-      - joomla_data:/var/www/html
+Initial SMTP configuration uses `JOOMLA_SMTP_HOST` and
+`JOOMLA_SMTP_HOST_PORT`. For an existing site, change its Joomla mail settings.
+Support for additional upstream variables follows the selected Joomla base.
 
-  mariadb:
-    image: mariadb:latest
-    environment:
-      MARIADB_USER: joomengine
-      MARIADB_DATABASE: joomengine
-      MARIADB_PASSWORD: secure_password12345
-      MARIADB_ROOT_PASSWORD: your_root_secure_password12345
-    volumes:
-      - mariadb_data:/var/lib/mysql
+## Debugging and development tools
 
-volumes:
-  joomla_data:
-  mariadb_data:
+The dev profile inherits Xdebug, Composer, Node/npm/npx, Git, SSH tools, PCNTL,
+sockets, and the rest of Joomla's development tooling. Project dependencies still
+belong in the project's Composer/npm manifests and lock files.
+
+Xdebug is enabled with `develop,debug`; debug sessions start on a trigger. Enable
+your IDE's PHP debugger listener on port 9003 and map the container's
+`/var/www/html` to the matching local project directory. Xdebug connects outward
+to the IDE: do not publish container port 9003.
+
+The Compose example includes Linux Docker Engine's
+`host.docker.internal:host-gateway` mapping. For a remote Docker host, set
+`JOOMLA_XDEBUG_CLIENT_HOST` to an IDE address reachable from the container.
+`JOOMLA_XDEBUG_CLIENT_PORT` defaults to `9003`.
+
+Trigger a CLI debug session with:
+
+```bash
+docker compose exec -e XDEBUG_TRIGGER=1 joomla php cli/joomla.php list
 ```
 
-Open your browser at:
+For web requests, use a browser Xdebug extension or `?XDEBUG_TRIGGER=1`.
+Check the installed extension with:
+
+```bash
+docker compose exec joomla php --ri xdebug
 ```
-http://localhost:8080
-```
 
-**Admin credentials:**
-- Username: `joomengine`
-- Password: `joomengine@secure`
+Set `XDEBUG_MODE=off` in the service environment and recreate the container to
+disable Xdebug. This leaves the development tools installed; switch to a normal
+image to remove them from the container. See the upstream
+[development guide](https://github.com/joomla-docker/docker-joomla/blob/master/docs/development.md)
+for editor configuration and connection diagnostics.
 
-These example credentials are for local development only. Override them for
-every shared, staging, or production deployment.
-
----
-
-## 🔐 Security & Permissions
-
-* The entrypoint and upstream server master may start as root, matching the
-  official Joomla Apache/FPM image model
-* Apache request workers use `APACHE_RUN_USER` and `APACHE_RUN_GROUP`; numeric
-  values such as `1000` are normalized to Apache's `#1000` form
-* FPM request workers run as `www-data`
-* Installer, extension, SMTP, and Joomla CLI operations are synchronous
-* File ownership is always repaired recursively after those operations and on
-  ordinary restarts; repair failures are fatal and visible
-* Safe for persistent volumes
-* Strict mode prevents silent misconfigurations
-
----
-
-## 🧾 License
-
-Copyright (C) 2021–2026
-Llewellyn van der Merwe
-
-Licensed under the **GNU General Public License v2 (GPLv2)**
-
-See `LICENSE` for details.
+Run development commands as the owner of the project files. Supply writable
+Composer/npm cache directories for that user and provide Git/SSH credentials
+through deployment mounts or an SSH agent.

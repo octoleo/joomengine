@@ -2,11 +2,27 @@
 # Shared MCP update-server resolution for the image generator and release poller.
 # Sourcing this file does not fetch data or change the caller's shell options.
 
-MCP_UPDATE_URL="${MCP_UPDATE_URL:-https://raw.githubusercontent.com/joomengine/mcp_package/refs/heads/main/.github/joomengine_mcp_update_server.xml}"
-
 _mcp_error() {
 	printf '[ERROR] MCP package: %s\n' "$*" >&2
 	return 2
+}
+
+# Resolve configuration only when requested; sourcing this helper has no effects.
+mcp_update_url() {
+	local configuration="${1:-}" url
+	if [[ -n ${MCP_UPDATE_URL:-} ]]; then
+		url="$MCP_UPDATE_URL"
+	else
+		if [[ -z "$configuration" ]]; then
+			configuration="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/conf/build.json" || return 2
+		fi
+		url="$(jq -er '.sources.mcp_updates_url | select(type == "string" and length > 0)' "$configuration")" || {
+			_mcp_error "missing update URL in configuration: $configuration"
+			return 2
+		}
+	fi
+	_mcp_https_url_valid "$url" || { _mcp_error 'update URL must be safe HTTPS'; return 2; }
+	printf '%s\n' "$url"
 }
 
 _mcp_version_normalize() {
@@ -143,7 +159,10 @@ mcp_package_supports() {
 
 # Fetch once per build/poll invocation; deploys use the pinned archive in the image.
 mcp_fetch_package() (
-	local url="${1:-$MCP_UPDATE_URL}" xml_file
+	local url="${1:-}" xml_file
+	if [[ -z "$url" ]]; then
+		url="$(mcp_update_url)" || return 2
+	fi
 	_mcp_https_url_valid "$url" || { _mcp_error 'update URL must be safe HTTPS'; return 2; }
 	xml_file="$(mktemp)" || return 2
 	trap 'rm -f -- "$xml_file"' EXIT

@@ -548,6 +548,119 @@ test_refresh_current_does_not_upgrade_versions() {
 	assert_file_contains "$case_dir/github-output" "updated_majors="
 }
 
+prepare_profile_case() {
+	local case_dir
+	case_dir="$(prepare_case "$1")"
+	jq 'with_entries(.value.profiles = ["standard"]) |
+		.["6"].profiles = ["standard", "dev"]' \
+		"$case_dir/versions.json" > "$case_dir/versions.next"
+	mv "$case_dir/versions.next" "$case_dir/versions.json"
+	jq '.tags += (.tags | with_entries(select(.key | startswith("6.")) | .key += "-dev"))' \
+		"$case_dir/upstream-images.json" > "$case_dir/state.next"
+	mv "$case_dir/state.next" "$case_dir/upstream-images.json"
+	jq '.results += [.results[] | select(.name | startswith("6.")) | .name += "-dev"]' \
+		"$FIXTURES/docker-tags-current.json" > "$case_dir/current-tags.json"
+	jq '.results += [.results[] | select(.name | startswith("6.")) |
+		.name |= sub("^6.1.3"; "6.1.4")]' \
+		"$case_dir/current-tags.json" > "$case_dir/candidate-tags.json"
+	printf '%s\n' "$case_dir"
+}
+
+test_all_profiles_are_required_before_promotion() {
+	local case_dir
+	case_dir="$(prepare_profile_case profile-readiness)"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	# Standard images alone cannot promote a release whose dev matrix is configured.
+	jq ' .results |= map(select(.name != "6.1.4-php8.4-apache-dev"))' \
+		"$case_dir/candidate-tags.json" > "$case_dir/pending-tags.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/pending-tags.json" "$case_dir/pending-output"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "missing dev image advanced Joomla"
+	assert_file_contains "$case_dir/pending-output" 'waiting_majors=6'
+	assert_file_contains "$case_dir/pending-output" 'versions_changed=no'
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.4-php8.3-fpm")' false
+
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-six-new.json" "$case_dir/candidate-tags.json" "$case_dir/ready-output"
+	assert_json_value "$case_dir/versions.json" '.["6"].joomla' 6.1.4
+	assert_json_value "$case_dir/versions.json" '.["6"].profiles | join(",")' standard,dev
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.4-php8.4-apache-dev")' true
+	assert_json_value "$case_dir/upstream-images.json" '.tags | has("6.1.3-php8.4-apache-dev")' false
+	assert_json_value "$case_dir/upstream-images.json" '.tags | keys | map(select(test("^[45].*-dev$"))) | length' 0
+	assert_file_contains "$case_dir/ready-output" 'updated_majors=6'
+}
+
+test_dev_digest_drift_without_version_change() {
+	local case_dir
+	case_dir="$(prepare_profile_case dev-digest-drift)"
+	# Prime normalized state so only the subsequent dev change is observed.
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-current.json" "$case_dir/current-tags.json" "$case_dir/initial-output"
+	cp "$case_dir/upstream-images.json" "$case_dir/state.before"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	jq '(.results[] | select(.name == "6.1.3-php8.4-apache-dev")) |=
+		(.digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
+		.images[0].digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")' \
+		"$case_dir/current-tags.json" > "$case_dir/drift-tags.json"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-current.json" "$case_dir/drift-tags.json" "$case_dir/drift-output"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "dev drift changed Joomla version"
+	assert_json_value "$case_dir/upstream-images.json" '.tags["6.1.3-php8.4-apache-dev"].index_digest' \
+		sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+	jq 'del(.tags["6.1.3-php8.4-apache-dev"])' "$case_dir/state.before" > "$case_dir/standard.before"
+	jq 'del(.tags["6.1.3-php8.4-apache-dev"])' "$case_dir/upstream-images.json" > "$case_dir/standard.after"
+	cmp -s "$case_dir/standard.before" "$case_dir/standard.after" || fail "dev drift changed unrelated image state"
+	assert_file_contains "$case_dir/drift-output" 'versions_changed=no'
+	assert_file_contains "$case_dir/drift-output" 'digests_changed=yes'
+}
+
+test_profiles_never_enable_downgrades() {
+	local case_dir
+	case_dir="$(prepare_profile_case profiles-no-downgrade)"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-downgrade.json" "$case_dir/current-tags.json" "$case_dir/github-output"
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "profile matrix allowed a downgrade"
+	assert_file_contains "$case_dir/github-output" 'versions_changed=no'
+	assert_file_contains "$case_dir/github-output" 'updated_majors='
+}
+
+test_missing_current_dev_image_fails_without_mutation() {
+	local case_dir
+	case_dir="$(prepare_profile_case missing-current-dev)"
+	cp "$case_dir/versions.json" "$case_dir/versions.before"
+	cp "$case_dir/upstream-images.json" "$case_dir/state.before"
+	jq '.results |= map(select(.name != "6.1.3-php8.4-apache-dev"))' \
+		"$case_dir/current-tags.json" > "$case_dir/missing-tags.json"
+	if run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+		"$FIXTURES/releases-current.json" "$case_dir/missing-tags.json" "$case_dir/github-output" \
+		> "$case_dir/stdout" 2> "$case_dir/stderr"; then
+		fail "unavailable configured dev tag succeeded"
+	fi
+	cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "missing dev tag changed versions"
+	cmp -s "$case_dir/state.before" "$case_dir/upstream-images.json" || fail "missing dev tag changed state"
+	grep -Fq '6.1.3-php8.4-apache-dev' "$case_dir/stderr" || fail "missing dev diagnostic omitted tag"
+}
+
+test_invalid_profile_matrix_fails_without_mutation() {
+	local profiles case_dir
+	for profiles in 'null' '[]' '["unknown"]' '["standard", "standard"]' '"dev"' '[1]'; do
+		case_dir="$(prepare_profile_case "invalid-profile-${RANDOM}")"
+		jq --argjson profiles "$profiles" '.["6"].profiles = $profiles' \
+			"$case_dir/versions.json" > "$case_dir/versions.next"
+		mv "$case_dir/versions.next" "$case_dir/versions.json"
+		cp "$case_dir/versions.json" "$case_dir/versions.before"
+		cp "$case_dir/upstream-images.json" "$case_dir/state.before"
+		if run_detector "$case_dir/versions.json" "$case_dir/upstream-images.json" \
+			"$FIXTURES/releases-current.json" "$case_dir/current-tags.json" "$case_dir/github-output" \
+			> "$case_dir/stdout" 2> "$case_dir/stderr"; then
+			fail "invalid profiles accepted: $profiles"
+		fi
+		cmp -s "$case_dir/versions.before" "$case_dir/versions.json" || fail "invalid profiles changed versions"
+		cmp -s "$case_dir/state.before" "$case_dir/upstream-images.json" || fail "invalid profiles changed state"
+	done
+}
+
 test_no_change
 echo "ok - current versions and digests are a byte-for-byte no-op"
 test_all_candidate_tags_ready
@@ -584,4 +697,14 @@ test_candidate_does_not_require_official_metadata
 echo "ok - published candidate tags do not depend on official-images metadata"
 test_refresh_current_does_not_upgrade_versions
 echo "ok - refresh-current repairs missing digest state without upgrading Joomla"
+test_all_profiles_are_required_before_promotion
+echo "ok - a release waits for all configured standard/dev images without requiring unsupported dev series"
+test_dev_digest_drift_without_version_change
+echo "ok - development image digest drift refreshes only its own image state"
+test_profiles_never_enable_downgrades
+echo "ok - a profile matrix cannot cause a Joomla downgrade"
+test_missing_current_dev_image_fails_without_mutation
+echo "ok - a missing configured development tag fails without mutation"
+test_invalid_profile_matrix_fails_without_mutation
+echo "ok - empty, duplicate and unknown profiles fail without mutation"
 bash "$TEST_DIR/test-registry.sh"

@@ -1,0 +1,35 @@
+{
+	"schema": 1,
+	"image": "octoleo/joomengine",
+	"baseImage": "joomla",
+	"defaultProfile": "dev",
+	"profiles": {
+		"standard": { "suffix": "" },
+		"dev": { "suffix": "-dev" }
+	},
+	"sources": {
+		"joomla_releases_url": "https://downloads.joomla.org/api/v1/latest/cms",
+		"joomla_repository": "library/joomla",
+		"jcb_updates": {
+			"4": "https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads/4.x/componentbuilder_update_server.xml",
+			"5": "https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads/5.x/componentbuilder_update_server.xml",
+			"6": "https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads/6.x/componentbuilder_update_server.xml"
+		},
+		"mcp_updates_url": "https://raw.githubusercontent.com/joomengine/mcp_package/refs/heads/main/.github/joomengine_mcp_update_server.xml"
+	},
+	"labels": {
+		"org.opencontainers.image.title": "Joomla! Component Builder - JoomEngine",
+		"org.opencontainers.image.source": "https://github.com/octoleo/joomengine"
+	},
+	"packageDirectory": "/usr/src/joomengine",
+	"environment": {
+		"JOOMLA_DB_USER": "joomengine",
+		"JOOMLA_DB_NAME": "joomengine",
+		"JOOMLA_SITE_NAME": "Joomla Component Builder - JoomEngine",
+		"JOOMLA_ADMIN_USER": "JoomEngine Hero",
+		"JOOMLA_ADMIN_USERNAME": "joomengine",
+		"JOOMLA_ADMIN_PASSWORD": "joomengine@secure",
+		"JOOMLA_ADMIN_EMAIL": "joomengine@example.com",
+		"JOOMLA_WEBROOT": "/var/www/html"
+	}
+}
