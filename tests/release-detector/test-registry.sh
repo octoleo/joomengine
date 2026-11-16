@@ -215,6 +215,57 @@ test_registry_token_validation() {
 	done
 }
 
+test_registry_profiles_keep_distinct_verified_indexes() {
+	local case_dir standard_tag dev_tag expected_standard expected_dev
+	case_dir="$(prepare_case registry-dev-profile)"
+	standard_tag=6.2.0-php8.3-apache
+	dev_tag="$standard_tag-dev"
+	jq '{"6": {joomla: "6.2.0", php: ["8.3"], variants: ["apache"], profiles: ["standard", "dev"]}}' \
+		"$case_dir/versions.json" > "$case_dir/versions.next"
+	mv "$case_dir/versions.next" "$case_dir/versions.json"
+	rm "$case_dir/upstream-images.json"
+	cp "$FIXTURES/registry-index.json" "$case_dir/registry/$standard_tag.json"
+	jq '.manifests[0].digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' \
+		"$FIXTURES/registry-index.json" > "$case_dir/registry/$dev_tag.json"
+	expected_standard="sha256:$(sha256sum "$case_dir/registry/$standard_tag.json" | cut -d ' ' -f 1)"
+	expected_dev="sha256:$(sha256sum "$case_dir/registry/$dev_tag.json" | cut -d ' ' -f 1)"
+	run_detector "$case_dir" --refresh-current
+	assert_json_value "$case_dir/upstream-images.json" ".tags[\"$standard_tag\"].index_digest" "$expected_standard"
+	assert_json_value "$case_dir/upstream-images.json" ".tags[\"$dev_tag\"].index_digest" "$expected_dev"
+	assert_json_value "$case_dir/upstream-images.json" ".tags[\"$dev_tag\"].platforms[\"linux/amd64\"]" \
+		sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+	assert_json_value "$case_dir/upstream-images.json" '.tags | length' 2
+	# Dev content must satisfy the same raw-byte digest checks as standard images.
+	printf '%s\n' "$expected_standard" > "$case_dir/registry/$dev_tag.digest"
+	rm "$case_dir/github-output"
+	assert_failure_without_mutation "$case_dir" --refresh-current
+}
+
+test_registry_sources_follow_build_configuration() {
+	local case_dir repository release_url
+	case_dir="$(prepare_case configured-sources)"
+	repository=fixture/joomla
+	release_url=https://releases.example.test/joomla/stable
+	jq --arg repository "$repository" --arg release_url "$release_url" '
+		.baseImage = $repository |
+		.sources.joomla_repository = $repository |
+		.sources.joomla_releases_url = $release_url' \
+		"$REPO_ROOT/conf/build.json" > "$case_dir/build.json"
+	jq --arg repository "$repository" '.repository = $repository' \
+		"$case_dir/upstream-images.json" > "$case_dir/state.next"
+	mv "$case_dir/state.next" "$case_dir/upstream-images.json"
+	cp "$FIXTURES/releases-multi-platform-current.json" "$case_dir/registry/releases.json"
+	MOCK_REGISTRY_REPOSITORY="$repository" MOCK_RELEASES_URL="$release_url" \
+		run_detector "$case_dir" --config-file "$case_dir/build.json"
+	assert_json_value "$case_dir/upstream-images.json" '.repository' "$repository"
+	grep -Fqx "$release_url" "$case_dir/registry/requests.log" || fail "configured release feed was ignored"
+	grep -Fqx "https://registry-1.docker.io/v2/$repository/manifests/$CURRENT_TAG" \
+		"$case_dir/registry/requests.log" || fail "configured registry repository was ignored"
+	grep -Fqx "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repository:pull" \
+		"$case_dir/registry/requests.log" || fail "token scope does not match configured repository"
+	assert_output "$case_dir" 'versions_changed=no'
+}
+
 test_registry_index_types_and_attestations
 echo "ok - OCI indexes and Docker lists are byte-verified, attestation-filtered, and stable"
 test_registry_platform_variants_match_builder_names
@@ -229,3 +280,7 @@ test_registry_candidate_does_not_invent_unpublished_platforms
 echo "ok - registry publication, independent of planned riscv64, controls candidate readiness"
 test_registry_token_validation
 echo "ok - registry authentication is validated and supports token/access_token"
+test_registry_profiles_keep_distinct_verified_indexes
+echo "ok - standard and dev indexes retain distinct byte-verified digests and platform records"
+test_registry_sources_follow_build_configuration
+echo "ok - build configuration controls the release feed, registry repository, token scope and state identity"

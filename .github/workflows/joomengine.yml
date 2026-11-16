@@ -10,13 +10,13 @@ on:
     branches: [master]
     paths:
       - ".github/workflows/joomengine.yml"
+      - "conf/build.json"
       - "conf/maintainers.json"
       - "conf/versions.json"
       - "conf/upstream-images.json"
       - "src/bin/check-joomla-releases.sh"
       - "src/bin/joomengine.sh"
       - "src/lib/**"
-      - "src/docker/**"
 
 permissions:
   contents: write
@@ -47,7 +47,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             curl \
-            gawk \
             jq \
             xmlstarlet
 

@@ -25,6 +25,7 @@ DRY_RUN="no"
 BUILD_ONLY="no"
 FORCE_UPDATE="no"
 PLATFORMS_SPEC="auto"
+BUILD_CONFIG_FILE="$REPO_ROOT/conf/build.json"
 
 show_help() {
 	cat <<'EOF'
@@ -36,6 +37,7 @@ Options:
   -f, --force        Force update docker folder/files
       --build-only   Build images locally, do not push
       --platforms    Platforms to build: auto or a comma-separated Linux subset
+      --config-file  Image-generation JSON configuration (default: conf/build.json)
   -h, --help         Show this help and exit
 
 Behavior:
@@ -82,6 +84,11 @@ while [[ $# -gt 0 ]]; do
 		--platforms=*)
 			PLATFORMS_SPEC="${1#*=}"
 			shift
+			;;
+		--config-file)
+			[[ $# -ge 2 ]] || { echo '[ERROR] --config-file requires a path' >&2; exit 1; }
+			BUILD_CONFIG_FILE="$(realpath "$2")"
+			shift 2
 			;;
 		-h|--help)
 			show_help
@@ -202,53 +209,59 @@ if [[ ! -f "$MAINTAINERS_JSON_FILE" ]]; then
 	exit 1
 fi
 
-DOCKERFILE_TEMPLATE="$REPO_ROOT/src/docker/Dockerfile.template"
-DOCKER_ENTRYPOINT="$REPO_ROOT/src/docker/docker-entrypoint.sh"
+IMAGE_CONFIG_HELPER="$REPO_ROOT/src/lib/image-config.sh"
 MCP_HELPER="$REPO_ROOT/src/lib/mcp-package.sh"
-# shellcheck source=src/lib/mcp-package.sh
-source "$MCP_HELPER"
-
-# --------------------------------------------------
-# Safety check
-# --------------------------------------------------
-if [[ ! -f "$DOCKERFILE_TEMPLATE" ]]; then
-	echo "[ERROR] Unable to determine docker template file path"
-	echo "Resolved DOCKERFILE_TEMPLATE=$DOCKERFILE_TEMPLATE"
-	exit 1
-fi
-
-if [[ ! -f "$DOCKER_ENTRYPOINT" ]]; then
-	echo "[ERROR] Unable to determine docker entrypoint file path"
-	echo "Resolved DOCKER_ENTRYPOINT=$DOCKER_ENTRYPOINT"
-	exit 1
-fi
+# shellcheck source=src/lib/image-config.sh
+source "$IMAGE_CONFIG_HELPER"
 
 IMAGES_PATH="$REPO_ROOT/images"
 LOG_PATH="$REPO_ROOT/log"
 TAG_LOG_FILE="$LOG_PATH/joomengine-tag.log"
 
-AWK_SCRIPT="$REPO_ROOT/src/docker/.jq-template.awk"
-if [ -n "${BASHBREW_SCRIPTS:-}" ]; then
-	AWK_SCRIPT="$BASHBREW_SCRIPTS/jq-template.awk"
-fi
-
-BASE_XML_URL="https://raw.githubusercontent.com/joomengine/Joomla-Component-Builder/refs/heads"
-
 # --------------------------------------------------
 # TOOLING CHECK
 # --------------------------------------------------
-for cmd in jq curl xmlstarlet gawk grep sort sha256sum find; do
+for cmd in jq curl xmlstarlet awk grep sort sha256sum find; do
 	command -v "$cmd" >/dev/null || {
 		echo "Missing required command: $cmd"
 		exit 1
 	}
 done
 
+image_config_validate "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE"
+IMAGE_NAME="$(jq -er '.image' "$BUILD_CONFIG_FILE")"
+BASE_IMAGE_NAME="$(jq -er '.baseImage' "$BUILD_CONFIG_FILE")"
+BASE_REPOSITORY="$(jq -er '.sources.joomla_repository' "$BUILD_CONFIG_FILE")"
+DEFAULT_PROFILE="$(jq -er '.defaultProfile' "$BUILD_CONFIG_FILE")"
+# shellcheck source=src/lib/mcp-package.sh
+source "$MCP_HELPER"
+MCP_UPDATE_URL="$(mcp_update_url "$BUILD_CONFIG_FILE")"
+
+# A profile selects development tooling independently of the HTTP runtime and
+# MCP package flavor. Every configured selector must resolve before generation.
+if ! jq -e --slurpfile build "$BUILD_CONFIG_FILE" '
+	type == "object" and length > 0 and all(to_entries[];
+		.key as $major | .value as $series |
+		($major | test("^[0-9]+$")) and
+		($series.joomla | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+		($series.php | type == "array" and length > 0 and length == (unique | length) and
+			all(.[]; type == "string" and test("^[0-9]+\\.[0-9]+$"))) and
+		($series.variants | type == "array" and length > 0 and length == (unique | length) and
+			all(.[]; . == "apache" or . == "fpm" or . == "fpm-alpine")) and
+		(($series.profiles // ["standard"]) | type == "array" and length > 0 and
+			length == (unique | length) and all(.[]; $build[0].profiles[.] != null)) and
+		($build[0].sources.jcb_updates[$major] | type == "string" and length > 0)
+	)
+' "$VERSIONS_JSON_FILE" >/dev/null; then
+	echo '[ERROR] Invalid image matrix or missing JSON release source/profile' >&2
+	exit 1
+fi
+
 validate_upstream_image_state() {
-	jq -e '
+	jq -e --arg repository "$BASE_REPOSITORY" '
 		type == "object" and
 		.schema == 2 and
-		.repository == "library/joomla" and
+		.repository == $repository and
 		(.tags | type == "object") and
 		all(
 			.tags | to_entries[];
@@ -269,11 +282,11 @@ validate_upstream_image_state() {
 # digest state. Resolve the complete configured matrix before any build work;
 # the release detector preserves these versions with --refresh-current.
 upstream_state_covers_matrix() {
-	jq -e --slurpfile versions "$VERSIONS_JSON_FILE" '
+	jq -e --slurpfile versions "$VERSIONS_JSON_FILE" --slurpfile build "$BUILD_CONFIG_FILE" '
 		.tags as $tags |
-		[$versions[0][] | .joomla as $joomla |
+		[$versions[0][] | .joomla as $joomla | (.profiles // ["standard"])[] as $profile |
 			.php[] as $php | .variants[] |
-			($joomla + "-php" + $php + "-" + .)] |
+			($joomla + "-php" + $php + "-" + . + $build[0].profiles[$profile].suffix)] |
 		length > 0 and all(.[]; $tags[.] != null)
 	' "$UPSTREAM_IMAGES_FILE" >/dev/null
 }
@@ -290,7 +303,8 @@ if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]] || ! upstream_state_covers_matrix; then
 	if ! env -u GITHUB_OUTPUT "$SCRIPT_DIR/check-joomla-releases.sh" \
 		--refresh-current \
 		--versions-file "$VERSIONS_JSON_FILE" \
-		--state-file "$UPSTREAM_IMAGES_FILE"; then
+		--state-file "$UPSTREAM_IMAGES_FILE" \
+		--config-file "$BUILD_CONFIG_FILE"; then
 		echo "[ERROR] Unable to refresh verified Joomla base images; no images were built." >&2
 		exit 1
 	fi
@@ -298,23 +312,6 @@ if [[ ! -f "$UPSTREAM_IMAGES_FILE" ]] || ! upstream_state_covers_matrix; then
 		echo "[ERROR] Refreshed upstream image state does not cover the configured Joomla matrix." >&2
 		exit 1
 	fi
-fi
-
-if [[ -z "${BASHBREW_SCRIPTS:-}" ]] && [[ ! -f "$AWK_SCRIPT" || "$SCRIPT_PATH" -nt "$AWK_SCRIPT" ]]; then
-	AWK_TMP="$(mktemp "${AWK_SCRIPT}.download.XXXXXX")"
-	trap 'rm -f -- "$AWK_TMP"' EXIT
-	curl \
-		--fail \
-		--silent \
-		--show-error \
-		--location \
-		--retry 3 \
-		--connect-timeout 15 \
-		--max-time 60 \
-		--output "$AWK_TMP" \
-		'https://github.com/docker-library/bashbrew/raw/5f0c26381fb7cc78b2d217d58007800bdcfbcfa1/scripts/jq-template.awk'
-	mv "$AWK_TMP" "$AWK_SCRIPT"
-	trap - EXIT
 fi
 
 # Resolve one verified stable MCP release for this entire batch. Only MCP
@@ -339,21 +336,6 @@ generated_warning() {
 	#
 	EOH
 }
-
-# --------------------------------------------------
-# LOAD MAINTAINERS
-# --------------------------------------------------
-MAINTAINERS="$(
-	jq -cr '
-		. | map(
-			.firstname + " " +
-			.lastname + " <" +
-			.email + "> (@" +
-			.github + ")"
-		) | join(", ")
-	' "$MAINTAINERS_JSON_FILE"
-)"
-export MAINTAINERS
 
 # --------------------------------------------------
 # MOVE TO WORKING PATH
@@ -406,9 +388,8 @@ fi
 BUILD_INPUT_SHA="$(
 	for input_file in \
 		"$SCRIPT_PATH" \
-		"$AWK_SCRIPT" \
-		"$DOCKERFILE_TEMPLATE" \
-		"$DOCKER_ENTRYPOINT" \
+		"$IMAGE_CONFIG_HELPER" \
+		"$BUILD_CONFIG_FILE" \
 		"$MAINTAINERS_JSON_FILE"; do
 		sha256sum "$input_file" | awk '{ print $1 }'
 	done \
@@ -556,7 +537,7 @@ mapfile -t MAJORS < <(jq -r 'keys[]' "$VERSIONS_JSON_FILE")
 # PASS 1: CONTEXT GENERATION + RELEASE COLLECTION
 # --------------------------------------------------
 declare -a REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_INPUT_SHA REL_JOOMLA
-declare -A PHP_LIST_BY_MAJOR VARIANT_LIST_BY_MAJOR HIGHEST_PHP_BY_MAJOR PROCESSED_MAJORS
+declare -A PHP_LIST_BY_MAJOR VARIANT_LIST_BY_MAJOR PROFILE_LIST_BY_MAJOR DEFAULT_PROFILE_BY_MAJOR HIGHEST_PHP_BY_MAJOR PROCESSED_MAJORS
 declare -A PENDING_BUILDS MCP_COMPATIBLE
 PENDING_BUILD_COUNT=0
 EXPECTED_MANIFEST_RECORD_COUNT=0
@@ -595,7 +576,7 @@ for MAJOR in "${MAJORS[@]}"; do
 	echo
 	echo "▶ Processing major $MAJOR"
 
-	XML_URL="${BASE_XML_URL}/${MAJOR}.x/componentbuilder_update_server.xml"
+	XML_URL="$(jq -er --arg major "$MAJOR" '.sources.jcb_updates[$major]' "$BUILD_CONFIG_FILE")"
 	TMP_XML="$(mktemp)"
 
 	if ! curl \
@@ -617,10 +598,18 @@ for MAJOR in "${MAJORS[@]}"; do
 
 	mapfile -t PHP_VERSIONS < <(jq -r ".\"$MAJOR\".php[]" "$VERSIONS_JSON_FILE")
 	mapfile -t VARIANTS < <(jq -r ".\"$MAJOR\".variants[]" "$VERSIONS_JSON_FILE")
+	mapfile -t PROFILES < <(jq -r --arg major "$MAJOR" '.[$major].profiles // ["standard"] | .[]' "$VERSIONS_JSON_FILE")
 	JOOMLA_VERSION="$(jq -r --arg m "$MAJOR" '.[$m].joomla' "$VERSIONS_JSON_FILE")"
 
 	PHP_LIST_BY_MAJOR["$MAJOR"]="${PHP_VERSIONS[*]}"
 	VARIANT_LIST_BY_MAJOR["$MAJOR"]="${VARIANTS[*]}"
+	PROFILE_LIST_BY_MAJOR["$MAJOR"]="${PROFILES[*]}"
+	DEFAULT_PROFILE_BY_MAJOR["$MAJOR"]="${PROFILES[0]}"
+	for PROFILE in "${PROFILES[@]}"; do
+		if [[ "$PROFILE" == "$DEFAULT_PROFILE" ]]; then
+			DEFAULT_PROFILE_BY_MAJOR["$MAJOR"]="$PROFILE"
+		fi
+	done
 
 	for p in "${PHP_VERSIONS[@]}"; do
 		HIGHEST_PHP_BY_MAJOR["$MAJOR"]="$(ver_max "${HIGHEST_PHP_BY_MAJOR[$MAJOR]:-}" "$p")"
@@ -665,64 +654,62 @@ for MAJOR in "${MAJORS[@]}"; do
 		REL_JOOMLA+=("$JOOMLA_VERSION")
 
 		for PHP in "${PHP_VERSIONS[@]}"; do
-			for VARIANT in "${VARIANTS[@]}"; do
-				BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
-				if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
-					echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
-					rm -f "$TMP_XML"
-					exit 1
-				fi
-				if ! select_base_platforms "$BASE_IMAGE_TAG"; then
-					rm -f "$TMP_XML"
-					exit 1
-				fi
-
-				select_image_flavors "$JOOMLA_VERSION" "$PHP"
-				for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
-					select_image_flavor
-					EXPECTED_MANIFEST_RECORD_COUNT=$((EXPECTED_MANIFEST_RECORD_COUNT + 1))
-					HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_INDEX_DIGEST} ${BASE_PLATFORM_STATE_SHA} ${SELECTED_PLATFORMS_CSV} ${FLAVOR} ${FLAVOR_MCP_INPUT_SHA}"
-					BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_INDEX_DIGEST}|${BASE_PLATFORM_STATE_SHA}|${SELECTED_PLATFORMS_CSV}|${FLAVOR}|${FLAVOR_MCP_INPUT_SHA}"
-					target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${FLAVOR_SUFFIX}"
-					target_dir="${IMAGES_PATH}/${target}"
-
-					if [[ "$FORCE_UPDATE" == "no" ]] && \
-						grep -Fxq -- "$HASH_RECORD" "$HASHES_FILE" && \
-						[[ -f "${target_dir}/Dockerfile" ]] && \
-						[[ -f "${target_dir}/docker-entrypoint.sh" ]]; then
-						echo "✅ JCB-${VERSION} PHP-${PHP} J-${JOOMLA_VERSION}(${VARIANT}${FLAVOR_SUFFIX}) already built - skipping"
-						printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
-						continue
+			for PROFILE in "${PROFILES[@]}"; do
+				PROFILE_SUFFIX="$(image_profile_suffix "$BUILD_CONFIG_FILE" "$PROFILE")"
+				for VARIANT in "${VARIANTS[@]}"; do
+					BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}${PROFILE_SUFFIX}"
+					if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
+						echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+						rm -f "$TMP_XML"
+						exit 1
+					fi
+					if ! select_base_platforms "$BASE_IMAGE_TAG"; then
+						rm -f "$TMP_XML"
+						exit 1
 					fi
 
-					PENDING_BUILDS["$BUILD_KEY"]=1
-					PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
+					select_image_flavors "$JOOMLA_VERSION" "$PHP"
+					for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
+						select_image_flavor
+						EXPECTED_MANIFEST_RECORD_COUNT=$((EXPECTED_MANIFEST_RECORD_COUNT + 1))
+						HASH_RECORD="${VERSION} ${PHP} ${JOOMLA_VERSION} ${VARIANT} ${SHA} ${RELEASE_INPUT_SHA} ${BUILD_INPUT_SHA} ${BASE_IMAGE_INDEX_DIGEST} ${BASE_PLATFORM_STATE_SHA} ${SELECTED_PLATFORMS_CSV} ${FLAVOR} ${FLAVOR_MCP_INPUT_SHA} ${PROFILE}"
+						BUILD_KEY="${VERSION}|${PHP}|${JOOMLA_VERSION}|${VARIANT}|${SHA}|${RELEASE_INPUT_SHA}|${BUILD_INPUT_SHA}|${BASE_IMAGE_INDEX_DIGEST}|${BASE_PLATFORM_STATE_SHA}|${SELECTED_PLATFORMS_CSV}|${FLAVOR}|${FLAVOR_MCP_INPUT_SHA}|${PROFILE}"
+						target="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}"
+						target_dir="${IMAGES_PATH}/${target}"
 
-					export IMAGE_FLAVOR="$FLAVOR"
-					export IMAGE_MCP_METADATA="$FLAVOR_MCP_JSON"
-					export JCB_VERSION="$VERSION"
-					export JCB_DOWNLOAD_URL="$URL"
-					export JCB_SHA512="$SHA"
-					export JCB_TAG="$TAG"
-					export PHP_VERSION="$PHP"
-					export VARIANT="$VARIANT"
-					export MAJOR_VERSION="$MAJOR"
-					export JOOMLA_VERSION="$JOOMLA_VERSION"
-					export BASE_IMAGE_INDEX_DIGEST="$BASE_IMAGE_INDEX_DIGEST"
+						if [[ "$FORCE_UPDATE" == "no" ]] && \
+							grep -Fxq -- "$HASH_RECORD" "$HASHES_FILE" && \
+							[[ -f "${target_dir}/Dockerfile" ]] && \
+							[[ ! -e "${target_dir}/docker-entrypoint.sh" ]]; then
+							echo "✅ JCB-${VERSION} PHP-${PHP} J-${JOOMLA_VERSION}(${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}) already built - skipping"
+							printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
+							continue
+						fi
 
-					mkdir -p "$target_dir"
+						PENDING_BUILDS["$BUILD_KEY"]=1
+						PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
 
-					echo "  -> generating ${target}"
+						mkdir -p "$target_dir"
 
-					cp "$DOCKER_ENTRYPOINT" "${target_dir}/docker-entrypoint.sh"
-					chmod +x "${target_dir}/docker-entrypoint.sh"
+						echo "  -> generating ${target}"
 
-					{
-						generated_warning
-						gawk -f "${AWK_SCRIPT}" "${DOCKERFILE_TEMPLATE}"
-					} > "${target_dir}/Dockerfile"
+						# Remove the old generated adapter when migrating an existing context.
+						rm -f -- "${target_dir}/docker-entrypoint.sh"
+						IMAGE_METADATA="$(jq -cn \
+							--arg joomla "$JOOMLA_VERSION" --arg php "$PHP" \
+							--arg variant "$VARIANT" --arg profile "$PROFILE" \
+							--arg base_digest "$BASE_IMAGE_INDEX_DIGEST" \
+							--arg version "$VERSION" --arg url "$URL" --arg sha512 "$SHA" \
+							--argjson mcp "$FLAVOR_MCP_JSON" \
+							'{joomla:$joomla,php:$php,variant:$variant,profile:$profile,
+							  base_digest:$base_digest,jcb:{version:$version,url:$url,sha512:$sha512},mcp:$mcp}')"
+						{
+							generated_warning
+							image_render_dockerfile "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE" "$IMAGE_METADATA"
+						} > "${target_dir}/Dockerfile"
 
-					printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
+						printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
+					done
 				done
 			done
 
@@ -762,8 +749,6 @@ done
 # --------------------------------------------------
 # PASS 3: TAG EMISSION + BUILD MANIFEST
 # --------------------------------------------------
-IMAGE_NAME="octoleo/joomengine"
-
 emit_tag() {
 	printf "  - %s:%s\n" "$IMAGE_NAME" "$1" >> "$TAG_LOG_FILE"
 }
@@ -777,6 +762,7 @@ for i in "${!REL_VERSION[@]}"; do
 
 	IFS=' ' read -r -a PHP_VERSIONS <<< "${PHP_LIST_BY_MAJOR[$MAJOR]}"
 	IFS=' ' read -r -a VARIANTS <<< "${VARIANT_LIST_BY_MAJOR[$MAJOR]}"
+	IFS=' ' read -r -a PROFILES <<< "${PROFILE_LIST_BY_MAJOR[$MAJOR]}"
 	HIGHEST_PHP="${HIGHEST_PHP_BY_MAJOR[$MAJOR]}"
 
 	# Determine leadership status
@@ -798,204 +784,214 @@ for i in "${!REL_VERSION[@]}"; do
 	fi
 
 	for PHP in "${PHP_VERSIONS[@]}"; do
-		for VARIANT in "${VARIANTS[@]}"; do
-			select_image_flavors "$JOOMLA_VERSION" "$PHP"
-			for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
-				select_image_flavor
-				declare -A SEEN=()
-				IMAGE_TAGS=()
+		for PROFILE in "${PROFILES[@]}"; do
+			PROFILE_SUFFIX="$(image_profile_suffix "$BUILD_CONFIG_FILE" "$PROFILE")"
+			for VARIANT in "${VARIANTS[@]}"; do
+				select_image_flavors "$JOOMLA_VERSION" "$PHP"
+				for FLAVOR in "${IMAGE_FLAVORS[@]}"; do
+					select_image_flavor
+					declare -A SEEN=()
+					IMAGE_TAGS=()
 
-				emit_once() {
-					local t="$1$FLAVOR_SUFFIX"
-					if [[ -z "${SEEN[$t]:-}" ]]; then
-						SEEN["$t"]=1
-						IMAGE_TAGS+=("$t")
-						emit_tag "$t"
-					fi
-				}
+					emit_once() {
+						local t="$1${2-$PROFILE_SUFFIX}$FLAVOR_SUFFIX"
+						if [[ -z "${SEEN[$t]:-}" ]]; then
+							SEEN["$t"]=1
+							IMAGE_TAGS+=("$t")
+							emit_tag "$t"
+						fi
+					}
 
-				IS_APACHE="no"
-				IS_HIGHEST_PHP="no"
-				IS_LATEST="no"
-				IS_LATEST_MCP="no"
+					IS_APACHE="no"
+					IS_HIGHEST_PHP="no"
+					IS_LATEST="no"
+					IS_LATEST_MCP="no"
 
-				[[ "$VARIANT" == "apache" ]] && IS_APACHE="yes"
-				[[ "$PHP" == "$HIGHEST_PHP" ]] && IS_HIGHEST_PHP="yes"
+					[[ "$VARIANT" == "apache" ]] && IS_APACHE="yes"
+					[[ "$PHP" == "$HIGHEST_PHP" ]] && IS_HIGHEST_PHP="yes"
 
-				{
-					echo "--------------------------------------------------"
-					echo "IMAGE    : $IMAGE_NAME"
-					echo "VERSION  : $VERSION"
-					echo "MAJOR    : $V_MAJOR"
-					echo "MINOR    : $V_MINOR"
-					echo "PHP      : $PHP (highest: $HIGHEST_PHP)"
-					echo "VARIANT  : $VARIANT"
-					echo "FLAVOR   : $FLAVOR"
-					echo "JOOMLA   : $JOOMLA_VERSION"
-					echo "LEADERS  : stable_major=$IS_HIGHEST_STABLE_MAJOR stable_global=$IS_HIGHEST_STABLE_GLOBAL pr_major=$IS_HIGHEST_PRERELEASE_MAJOR pr_global=$IS_HIGHEST_PRERELEASE_GLOBAL"
-					echo "TAGS:"
-				} >> "$TAG_LOG_FILE"
+					{
+						echo "--------------------------------------------------"
+						echo "IMAGE    : $IMAGE_NAME"
+						echo "VERSION  : $VERSION"
+						echo "MAJOR    : $V_MAJOR"
+						echo "MINOR    : $V_MINOR"
+						echo "PHP      : $PHP (highest: $HIGHEST_PHP)"
+						echo "VARIANT  : $VARIANT"
+						echo "PROFILE  : $PROFILE"
+						echo "FLAVOR   : $FLAVOR"
+						echo "JOOMLA   : $JOOMLA_VERSION"
+						echo "LEADERS  : stable_major=$IS_HIGHEST_STABLE_MAJOR stable_global=$IS_HIGHEST_STABLE_GLOBAL pr_major=$IS_HIGHEST_PRERELEASE_MAJOR pr_global=$IS_HIGHEST_PRERELEASE_GLOBAL"
+						echo "TAGS:"
+					} >> "$TAG_LOG_FILE"
 
-				# ---- Base tag (always)
-				emit_once "${VERSION}-php${PHP}-${VARIANT}"
+					# ---- Base tag (always)
+					emit_once "${VERSION}-php${PHP}-${VARIANT}"
 
-				# ---- Apache shorthand
-				if [[ "$IS_APACHE" == "yes" ]]; then
-					emit_once "${VERSION}-php${PHP}"
-				fi
-
-				# ---- Highest PHP shorthand (variant-level + plain)
-				if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-					emit_once "${VERSION}-${VARIANT}"
+					# ---- Apache shorthand
 					if [[ "$IS_APACHE" == "yes" ]]; then
-						emit_once "${VERSION}"
-					fi
-				fi
-
-				# ---- Stable rolling tags (only if highest stable of this major)
-				if [[ "$V_IS_STABLE" == "yes" ]] && [[ "$IS_HIGHEST_STABLE_MAJOR" == "yes" ]]; then
-					# minor + major with full suffix
-					emit_once "${V_MINOR}-php${PHP}-${VARIANT}"
-					emit_once "${V_MAJOR}-php${PHP}-${VARIANT}"
-
-					# apache shorthand
-					if [[ "$IS_APACHE" == "yes" ]]; then
-						emit_once "${V_MINOR}-php${PHP}"
-						emit_once "${V_MAJOR}-php${PHP}"
+						emit_once "${VERSION}-php${PHP}"
 					fi
 
-					# highest php shorthand
+					# ---- Highest PHP shorthand (variant-level + plain)
 					if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-						emit_once "${V_MINOR}-${VARIANT}"
-						emit_once "${V_MAJOR}-${VARIANT}"
+						emit_once "${VERSION}-${VARIANT}"
 						if [[ "$IS_APACHE" == "yes" ]]; then
-							emit_once "${V_MINOR}"
-							emit_once "${V_MAJOR}"
+							emit_once "${VERSION}"
 						fi
 					fi
-				fi
 
-				# Each flavor has its own latest leader: a newer Joomla release
-				# that MCP does not yet support must not strand latest-mcp.
-				if [[ "$V_IS_STABLE" == "yes" ]] && \
-				   { [[ "$FLAVOR" == "standard" && "$IS_HIGHEST_STABLE_GLOBAL" == "yes" ]] || \
-				     [[ "$FLAVOR" == "mcp" && "$IS_HIGHEST_STABLE_MCP_GLOBAL" == "yes" ]]; } && \
-				   [[ "$IS_APACHE" == "yes" ]] && \
-				   [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-					emit_once "latest"
-					if [[ "$FLAVOR" == "mcp" ]]; then
-						IS_LATEST_MCP="yes"
-					else
-						IS_LATEST="yes"
-					fi
-				fi
+					# ---- Stable rolling tags (only if highest stable of this major)
+					if [[ "$V_IS_STABLE" == "yes" ]] && [[ "$IS_HIGHEST_STABLE_MAJOR" == "yes" ]]; then
+						# minor + major with full suffix
+						emit_once "${V_MINOR}-php${PHP}-${VARIANT}"
+						emit_once "${V_MAJOR}-php${PHP}-${VARIANT}"
 
-				# ---- Pre-release rolling tags
-				if [[ "$V_IS_STABLE" == "no" ]]; then
-					# Major-scoped leader for this pre-release type (numbered rolling tags)
-					if [[ "$IS_HIGHEST_PRERELEASE_MAJOR" == "yes" ]]; then
-						# Minor/major numbered tags
-						emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
-						emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
-
+						# apache shorthand
 						if [[ "$IS_APACHE" == "yes" ]]; then
-							emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-php${PHP}"
-							emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-php${PHP}"
+							emit_once "${V_MINOR}-php${PHP}"
+							emit_once "${V_MAJOR}-php${PHP}"
 						fi
 
+						# highest php shorthand
 						if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-							emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-${VARIANT}"
-							emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-${VARIANT}"
+							emit_once "${V_MINOR}-${VARIANT}"
+							emit_once "${V_MAJOR}-${VARIANT}"
 							if [[ "$IS_APACHE" == "yes" ]]; then
-								emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}"
-								emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}"
+								emit_once "${V_MINOR}"
+								emit_once "${V_MAJOR}"
 							fi
 						fi
 					fi
 
-					# Global leader for this pre-release type (channel tags without number)
-					if [[ "$IS_HIGHEST_PRERELEASE_GLOBAL" == "yes" ]]; then
-						emit_once "${V_MINOR}-${V_PR}-php${PHP}-${VARIANT}"
-						emit_once "${V_MAJOR}-${V_PR}-php${PHP}-${VARIANT}"
-
-						if [[ "$IS_APACHE" == "yes" ]]; then
-							emit_once "${V_MINOR}-${V_PR}-php${PHP}"
-							emit_once "${V_MAJOR}-${V_PR}-php${PHP}"
-						fi
-
-						if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
-							emit_once "${V_MINOR}-${V_PR}-${VARIANT}"
-							emit_once "${V_MAJOR}-${V_PR}-${VARIANT}"
-							if [[ "$IS_APACHE" == "yes" ]]; then
-								emit_once "${V_MINOR}-${V_PR}"
-								emit_once "${V_MAJOR}-${V_PR}"
+					# Each flavor has its own latest leader: a newer Joomla release
+					# that MCP does not yet support must not strand latest-mcp.
+					if [[ "$V_IS_STABLE" == "yes" ]] && \
+					   { [[ "$FLAVOR" == "standard" && "$IS_HIGHEST_STABLE_GLOBAL" == "yes" ]] || \
+					     [[ "$FLAVOR" == "mcp" && "$IS_HIGHEST_STABLE_MCP_GLOBAL" == "yes" ]]; } && \
+					   [[ "$IS_APACHE" == "yes" ]] && \
+					   [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
+						# Explicit profile aliases remain usable when the default changes.
+						emit_once "latest-${PROFILE}" ""
+						if [[ "$PROFILE" == "${DEFAULT_PROFILE_BY_MAJOR[$MAJOR]}" ]]; then
+							emit_once "latest" ""
+							if [[ "$FLAVOR" == "mcp" ]]; then
+								IS_LATEST_MCP="yes"
+							else
+								IS_LATEST="yes"
 							fi
 						fi
 					fi
-				fi
 
-				context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${FLAVOR_SUFFIX}"
-				BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}"
-				if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
-					echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
-					exit 1
-				fi
-				if ! select_base_platforms "$BASE_IMAGE_TAG"; then
-					exit 1
-				fi
+					# ---- Pre-release rolling tags
+					if [[ "$V_IS_STABLE" == "no" ]]; then
+						# Major-scoped leader for this pre-release type (numbered rolling tags)
+						if [[ "$IS_HIGHEST_PRERELEASE_MAJOR" == "yes" ]]; then
+							# Minor/major numbered tags
+							emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
+							emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-php${PHP}-${VARIANT}"
 
-				jq -nc \
-					--arg image "$IMAGE_NAME" \
-					--arg context "$context_path" \
-					--arg version "$VERSION" \
-					--arg latest "$IS_LATEST" \
-					--arg latest_mcp "$IS_LATEST_MCP" \
-					--arg flavor "$FLAVOR" \
-					--arg mcp_input_sha "$FLAVOR_MCP_INPUT_SHA" \
-					--argjson mcp "$FLAVOR_MCP_JSON" \
-					--arg major "$V_MAJOR" \
-					--arg minor "$V_MINOR" \
-					--arg php "$PHP" \
-					--arg variant "$VARIANT" \
-					--arg joomla "$JOOMLA_VERSION" \
-					--arg jcb_sha "${REL_SHA[$i]}" \
-					--arg release_input_sha "${REL_INPUT_SHA[$i]}" \
-					--arg build_input_sha "$BUILD_INPUT_SHA" \
-					--arg base_image "joomla:${BASE_IMAGE_TAG}@${BASE_IMAGE_INDEX_DIGEST}" \
-					--arg base_index_digest "$BASE_IMAGE_INDEX_DIGEST" \
-					--arg base_platform_state_sha "$BASE_PLATFORM_STATE_SHA" \
-					--argjson base_platforms "$BASE_PLATFORMS_JSON" \
-					--argjson platforms "$SELECTED_PLATFORMS_JSON" \
-					--argjson platform_digests "$SELECTED_PLATFORM_DIGESTS_JSON" \
-					--argjson tags "$(printf '%s\n' "${IMAGE_TAGS[@]}" | jq -R . | jq -s .)" \
-					'{
-						image: $image,
-						context: $context,
-						version: $version,
-						latest: $latest,
-						latest_mcp: $latest_mcp,
-						flavor: $flavor,
-						mcp: $mcp,
-						mcp_input_sha: $mcp_input_sha,
-						major: $major,
-						minor: $minor,
-						php: $php,
-						variant: $variant,
-						joomla: $joomla,
-						jcb_sha: $jcb_sha,
-						release_input_sha: $release_input_sha,
-						build_input_sha: $build_input_sha,
-						base_image: $base_image,
-						base_index_digest: $base_index_digest,
-						base_platform_state_sha: $base_platform_state_sha,
-						base_platforms: $base_platforms,
-						platforms: $platforms,
-						platform_digests: $platform_digests,
-						base_tag: $tags[0],
-						tags: $tags
-					}' >> "$NEXT_BUILD_MANIFEST_FILE"
+							if [[ "$IS_APACHE" == "yes" ]]; then
+								emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-php${PHP}"
+								emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-php${PHP}"
+							fi
 
-				echo >> "$TAG_LOG_FILE"
+							if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
+								emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}-${VARIANT}"
+								emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}-${VARIANT}"
+								if [[ "$IS_APACHE" == "yes" ]]; then
+									emit_once "${V_MINOR}-${V_PR}${V_PR_NUM}"
+									emit_once "${V_MAJOR}-${V_PR}${V_PR_NUM}"
+								fi
+							fi
+						fi
+
+						# Global leader for this pre-release type (channel tags without number)
+						if [[ "$IS_HIGHEST_PRERELEASE_GLOBAL" == "yes" ]]; then
+							emit_once "${V_MINOR}-${V_PR}-php${PHP}-${VARIANT}"
+							emit_once "${V_MAJOR}-${V_PR}-php${PHP}-${VARIANT}"
+
+							if [[ "$IS_APACHE" == "yes" ]]; then
+								emit_once "${V_MINOR}-${V_PR}-php${PHP}"
+								emit_once "${V_MAJOR}-${V_PR}-php${PHP}"
+							fi
+
+							if [[ "$IS_HIGHEST_PHP" == "yes" ]]; then
+								emit_once "${V_MINOR}-${V_PR}-${VARIANT}"
+								emit_once "${V_MAJOR}-${V_PR}-${VARIANT}"
+								if [[ "$IS_APACHE" == "yes" ]]; then
+									emit_once "${V_MINOR}-${V_PR}"
+									emit_once "${V_MAJOR}-${V_PR}"
+								fi
+							fi
+						fi
+					fi
+
+					context_path="jcb${VERSION}/j${JOOMLA_VERSION}/php${PHP}/${VARIANT}${PROFILE_SUFFIX}${FLAVOR_SUFFIX}"
+					BASE_IMAGE_TAG="${JOOMLA_VERSION}-php${PHP}-${VARIANT}${PROFILE_SUFFIX}"
+					if ! BASE_IMAGE_INDEX_DIGEST="$(get_base_image_index_digest "$BASE_IMAGE_TAG")"; then
+						echo "[ERROR] Missing verified index digest for official Joomla image tag: $BASE_IMAGE_TAG" >&2
+						exit 1
+					fi
+					if ! select_base_platforms "$BASE_IMAGE_TAG"; then
+						exit 1
+					fi
+
+					jq -nc \
+						--arg image "$IMAGE_NAME" \
+						--arg context "$context_path" \
+						--arg version "$VERSION" \
+						--arg latest "$IS_LATEST" \
+						--arg latest_mcp "$IS_LATEST_MCP" \
+						--arg flavor "$FLAVOR" \
+						--arg mcp_input_sha "$FLAVOR_MCP_INPUT_SHA" \
+						--argjson mcp "$FLAVOR_MCP_JSON" \
+						--arg major "$V_MAJOR" \
+						--arg minor "$V_MINOR" \
+						--arg php "$PHP" \
+						--arg variant "$VARIANT" \
+						--arg profile "$PROFILE" \
+						--arg joomla "$JOOMLA_VERSION" \
+						--arg jcb_sha "${REL_SHA[$i]}" \
+						--arg release_input_sha "${REL_INPUT_SHA[$i]}" \
+						--arg build_input_sha "$BUILD_INPUT_SHA" \
+						--arg base_image "${BASE_IMAGE_NAME}:${BASE_IMAGE_TAG}@${BASE_IMAGE_INDEX_DIGEST}" \
+						--arg base_index_digest "$BASE_IMAGE_INDEX_DIGEST" \
+						--arg base_platform_state_sha "$BASE_PLATFORM_STATE_SHA" \
+						--argjson base_platforms "$BASE_PLATFORMS_JSON" \
+						--argjson platforms "$SELECTED_PLATFORMS_JSON" \
+						--argjson platform_digests "$SELECTED_PLATFORM_DIGESTS_JSON" \
+						--argjson tags "$(printf '%s\n' "${IMAGE_TAGS[@]}" | jq -R . | jq -s .)" \
+						'{
+							image: $image,
+							context: $context,
+							version: $version,
+							latest: $latest,
+							latest_mcp: $latest_mcp,
+							flavor: $flavor,
+							mcp: $mcp,
+							mcp_input_sha: $mcp_input_sha,
+							major: $major,
+							minor: $minor,
+							php: $php,
+							variant: $variant,
+							profile: $profile,
+							joomla: $joomla,
+							jcb_sha: $jcb_sha,
+							release_input_sha: $release_input_sha,
+							build_input_sha: $build_input_sha,
+							base_image: $base_image,
+							base_index_digest: $base_index_digest,
+							base_platform_state_sha: $base_platform_state_sha,
+							base_platforms: $base_platforms,
+							platforms: $platforms,
+							platform_digests: $platform_digests,
+							base_tag: $tags[0],
+							tags: $tags
+						}' >> "$NEXT_BUILD_MANIFEST_FILE"
+
+					echo >> "$TAG_LOG_FILE"
+				done
 			done
 		done
 	done
@@ -1034,7 +1030,8 @@ manifest_build_key() {
 			.base_platform_state_sha,
 			(.platforms | join(",")),
 			.flavor,
-			.mcp_input_sha
+			.mcp_input_sha,
+			.profile
 		] | join("|")
 	'
 }
@@ -1052,6 +1049,7 @@ validate_pending_manifest_record() {
 	local computed_platform_state_sha
 
 	if ! jq -e '
+		(.profile | type == "string" and length > 0) and
 		(.flavor == "standard" or .flavor == "mcp") and
 		(if .flavor == "mcp" then
 			(.mcp | type == "object") and

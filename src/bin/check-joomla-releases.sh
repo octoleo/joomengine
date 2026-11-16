@@ -15,21 +15,19 @@ fi
 
 VERSIONS_FILE="$REPO_ROOT/conf/versions.json"
 STATE_FILE="$REPO_ROOT/conf/upstream-images.json"
+CONFIG_FILE="$REPO_ROOT/conf/build.json"
 RELEASES_FILE=""
 DOCKER_TAGS_FILE=""
 OFFICIAL_IMAGES_FILE=""
 QUIET="no"
 REFRESH_CURRENT="no"
 
-JOOMLA_RELEASES_URL="${JOOMLA_RELEASES_URL:-https://downloads.joomla.org/api/v1/latest/cms}"
-DOCKER_REGISTRY_API_BASE="${DOCKER_REGISTRY_API_BASE:-https://registry-1.docker.io/v2/library/joomla}"
-DOCKER_REGISTRY_TOKEN_URL="${DOCKER_REGISTRY_TOKEN_URL:-https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/joomla:pull}"
-
 show_help() {
 	cat <<'EOF'
 Usage: check-joomla-releases.sh [options]
 
 Options:
+      --config-file PATH       Build settings and upstream source configuration
       --versions-file PATH     Joomla build matrix to inspect and update
       --state-file PATH        Persist verified image-index and platform digests
       --refresh-current        Verify configured versions without checking releases
@@ -55,6 +53,14 @@ EOF
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+		--config-file)
+			[[ $# -ge 2 ]] || {
+				echo "[ERROR] --config-file requires a path" >&2
+				exit 1
+			}
+			CONFIG_FILE="$2"
+			shift 2
+			;;
 		--versions-file)
 			[[ $# -ge 2 ]] || {
 				echo "[ERROR] --versions-file requires a path" >&2
@@ -132,6 +138,29 @@ if [[ ( "$REFRESH_CURRENT" == "no" && -z "$RELEASES_FILE" ) || -z "$DOCKER_TAGS_
 	command -v curl >/dev/null 2>&1 || fail "Missing required command: curl"
 fi
 
+[[ -f "$CONFIG_FILE" && -r "$CONFIG_FILE" ]] || fail "Build configuration is not a readable file: $CONFIG_FILE"
+if ! jq -e '
+	.schema == 1 and
+	(.baseImage | type == "string" and test("^[a-zA-Z0-9][a-zA-Z0-9._/-]*$")) and
+	(.sources.joomla_repository | type == "string" and
+		test("^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)+$")) and
+	(.sources.joomla_releases_url | type == "string" and
+		test("^https://[^[:space:]]+$")) and
+	(.profiles | type == "object" and length > 0 and has("standard") and
+		all(to_entries[];
+			(.key | test("^[a-z0-9][a-z0-9_-]*$")) and
+			(.value.suffix | type == "string" and test("^(-[a-z0-9][a-z0-9._-]*)?$")))) and
+	([.profiles[].suffix] | length == (unique | length))
+' "$CONFIG_FILE" >/dev/null; then
+	fail "Invalid release-detector build configuration: $CONFIG_FILE"
+fi
+
+JOOMLA_REPOSITORY="$(jq -r '.sources.joomla_repository' "$CONFIG_FILE")"
+JOOMLA_BASE_IMAGE="$(jq -r '.baseImage' "$CONFIG_FILE")"
+JOOMLA_RELEASES_URL="${JOOMLA_RELEASES_URL:-$(jq -r '.sources.joomla_releases_url' "$CONFIG_FILE")}"
+DOCKER_REGISTRY_API_BASE="${DOCKER_REGISTRY_API_BASE:-https://registry-1.docker.io/v2/$JOOMLA_REPOSITORY}"
+DOCKER_REGISTRY_TOKEN_URL="${DOCKER_REGISTRY_TOKEN_URL:-https://auth.docker.io/token?service=registry.docker.io&scope=repository:$JOOMLA_REPOSITORY:pull}"
+
 [[ -f "$VERSIONS_FILE" ]] || fail "Versions file does not exist: $VERSIONS_FILE"
 [[ -r "$VERSIONS_FILE" ]] || fail "Versions file is not readable: $VERSIONS_FILE"
 
@@ -158,7 +187,7 @@ if [[ -n "$OFFICIAL_IMAGES_FILE" ]]; then
 	[[ -r "$OFFICIAL_IMAGES_FILE" ]] || fail "Official-images file is not readable: $OFFICIAL_IMAGES_FILE"
 fi
 
-if ! jq -e '
+if ! jq -e --slurpfile config "$CONFIG_FILE" '
 	type == "object" and
 	length > 0 and
 	all(
@@ -176,13 +205,18 @@ if ! jq -e '
 		(.value.variants |
 			type == "array" and
 			length > 0 and
-			all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$")))
+			all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))) and
+		(.value | (if has("profiles") then .profiles else ["standard"] end) |
+			type == "array" and
+			length > 0 and
+			length == (unique | length) and
+			all(.[]; type == "string" and (. as $profile | $config[0].profiles | has($profile))))
 	)
 ' "$VERSIONS_FILE" >/dev/null; then
 	fail "Invalid Joomla build matrix: $VERSIONS_FILE"
 fi
 
-if [[ -f "$STATE_FILE" ]] && ! jq -e '
+if [[ -f "$STATE_FILE" ]] && ! jq -e --arg repository "$JOOMLA_REPOSITORY" '
 	def digest:
 		type == "string" and test("^sha256:[a-f0-9]{64}$");
 	def platform:
@@ -204,7 +238,7 @@ if [[ -f "$STATE_FILE" ]] && ! jq -e '
 				true
 			end));
 	type == "object" and
-	.repository == "library/joomla" and
+	.repository == $repository and
 	(.tags | type == "object") and
 	(if .schema == 1 then
 		all(
@@ -638,11 +672,14 @@ collect_matrix_records() {
 	local role="$3"
 	local php_version
 	local variant
+	local profile
+	local profile_suffix
 	local tag
 	local record
 	local tag_status
 	local -a php_versions=()
 	local -a variants=()
+	local -a profiles=()
 
 	COLLECTED_TAGS=()
 	COLLECTED_RECORDS=()
@@ -650,32 +687,36 @@ collect_matrix_records() {
 
 	mapfile -t php_versions < <(jq -r --arg major "$major" '.[$major].php[]' "$VERSIONS_FILE")
 	mapfile -t variants < <(jq -r --arg major "$major" '.[$major].variants[]' "$VERSIONS_FILE")
+	mapfile -t profiles < <(jq -r --arg major "$major" '(.[$major].profiles // ["standard"])[]' "$VERSIONS_FILE")
 
 	for php_version in "${php_versions[@]}"; do
 		for variant in "${variants[@]}"; do
-			tag="${version}-php${php_version}-${variant}"
+			for profile in "${profiles[@]}"; do
+				profile_suffix="$(jq -r --arg profile "$profile" '.profiles[$profile].suffix' "$CONFIG_FILE")"
+				tag="${version}-php${php_version}-${variant}${profile_suffix}"
 
-			if record="$(docker_tag_record "$tag")"; then
-				:
-			else
-				tag_status=$?
-				if [[ "$tag_status" -ne 1 ]]; then
-					return 2
+				if record="$(docker_tag_record "$tag")"; then
+					:
+				else
+					tag_status=$?
+					if [[ "$tag_status" -ne 1 ]]; then
+						return 2
+					fi
+
+					COLLECTION_READY="no"
+					if [[ "$role" == "current" ]]; then
+						echo "[ERROR] Currently configured Docker tag is unavailable: $JOOMLA_BASE_IMAGE:$tag" >&2
+						return 2
+					fi
+
+					log "Joomla $major: waiting for official Docker tag $JOOMLA_BASE_IMAGE:$tag"
+					return 0
 				fi
 
-				COLLECTION_READY="no"
-				if [[ "$role" == "current" ]]; then
-					echo "[ERROR] Currently configured Docker tag is unavailable: joomla:$tag" >&2
-					return 2
-				fi
-
-				log "Joomla $major: waiting for official Docker tag joomla:$tag"
-				return 0
-			fi
-
-			COLLECTED_TAGS+=("$tag")
-			COLLECTED_RECORDS+=("$record")
-			log "Joomla $major: Docker tag ready on $(jq -r '.platforms | length' <<< "$record") platforms: joomla:$tag"
+				COLLECTED_TAGS+=("$tag")
+				COLLECTED_RECORDS+=("$record")
+				log "Joomla $major: Docker tag ready on $(jq -r '.platforms | length' <<< "$record") platforms: $JOOMLA_BASE_IMAGE:$tag"
+			done
 		done
 	done
 }
@@ -832,7 +873,8 @@ fi
 STATE_TMP="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
 jq --tab -n \
 	--argjson tags "$desired_tags_json" \
-	'{schema: 2, repository: "library/joomla", tags: $tags}' \
+	--arg repository "$JOOMLA_REPOSITORY" \
+	'{schema: 2, repository: $repository, tags: $tags}' \
 	> "$STATE_TMP"
 
 if ! jq -e . "$STATE_TMP" >/dev/null; then
