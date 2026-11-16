@@ -55,6 +55,36 @@ assert_command_before() {
 		fail "$file does not invoke '$earlier' before '$later'"
 }
 
+assert_tag_command_tail() {
+	local command_prefix="$1"
+	shift
+	local expected
+	local actual
+
+	expected="$(printf '%s\n' "$@")"
+	actual="$(awk -v prefix="$command_prefix" '
+		index($0, prefix) == 1 {
+			for (i = 1; i < NF; i++) if ($i == "--tag") print $(i + 1)
+		}
+	' "$TRACE_FILE" | tail -n "$#")"
+	[[ "$actual" == "$expected" ]] || fail "$command_prefix has unexpected final tag order: $actual"
+}
+
+assert_default_publication_tail() {
+	assert_tag_command_tail 'buildx build --pull' \
+		'octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev' \
+		'octoleo/joomengine:6.0.0-php8.5-apache-dev' \
+		'octoleo/joomengine:6.0.0-php8.5-apache-mcp' \
+		'octoleo/joomengine:6.0.0-php8.5-apache'
+	assert_tag_command_tail 'buildx imagetools create' \
+		'octoleo/joomengine:latest-mcp-dev' \
+		'octoleo/joomengine:latest-dev' \
+		'octoleo/joomengine:latest-mcp' \
+		'octoleo/joomengine:latest'
+	[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || \
+		fail 'normal latest was not the final registry operation'
+}
+
 assert_text_contains() {
 	local text="$1"
 	local expected="$2"
@@ -621,8 +651,10 @@ assert_command_before "$TRACE_FILE" 'imagetools inspect --format {{json .Manifes
 assert_command_before "$TRACE_FILE" 'buildx build --pull' 'buildx imagetools inspect --raw'
 assert_command_before "$TRACE_FILE" 'buildx imagetools inspect --raw' 'buildx imagetools create'
 assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --metadata-file' 'buildx imagetools create'
-[[ "$(tail -2 "$TRACE_FILE" | sed -n '1p')" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || fail 'plain latest was not deferred until all other aliases'
-[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest-mcp $PUBLISHED_REFERENCE" ]] || fail 'MCP latest was not deferred until all other aliases'
+assert_tag_command_tail 'buildx build --pull' \
+	'octoleo/joomengine:6.0.0-php8.4-apache-mcp' 'octoleo/joomengine:6.0.0-php8.4-apache'
+[[ "$(tail -2 "$TRACE_FILE" | sed -n '1p')" == "buildx imagetools create --tag octoleo/joomengine:latest-mcp $PUBLISHED_REFERENCE" ]] || fail 'MCP latest was not deferred until the final normal latest'
+[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || fail 'plain latest was not the final published alias'
 jq -e '
 	.platforms == ["linux/386", "linux/amd64", "linux/arm/v5", "linux/arm64/v8"] and
 	.platform_digests == .base_platforms
@@ -735,7 +767,7 @@ JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 	run_engine_args
-assert_not_contains "$TRACE_FILE" 'buildx build --pull'
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'topology-only promotion did not rebuild the available default owners'
 assert_contains "$TRACE_FILE" 'buildx imagetools inspect --format {{json .Manifest}} octoleo/joomengine:6.0.0-php8.4-apache'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
 assert_contains "$TRACE_FILE" "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE"
@@ -752,13 +784,13 @@ if JOOMENGINE_EXPECT_FAILURE=yes \
 	run_engine_args; then
 	fail 'failed registry alias promotion returned success'
 fi
-assert_not_contains "$TRACE_FILE" 'buildx build --pull'
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'topology retry did not rebuild the available default owners'
 assert_contains "$TRACE_FILE" 'buildx imagetools create'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$failed_topology_hashes" ]] || fail 'failed alias promotion committed registry state'
 
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 	run_engine_args
-assert_not_contains "$TRACE_FILE" 'buildx build --pull'
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'failed topology promotion retry did not rebuild the available default owners'
 [[ "$(grep -Fc 'buildx imagetools create' "$TRACE_FILE")" -eq "$expected_alias_count" ]] || fail 'failed alias promotion suppressed its retry'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$topology_hashes" ]] || fail 'alias retry did not commit reconciled topology state'
 echo 'ok - failed alias promotion leaves topology pending for retry'
@@ -886,8 +918,96 @@ run_engine
 [[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'one dev base digest change rebuilt unrelated profiles or runtimes'
 assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.5-apache-dev --load'
 assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev --load'
+assert_tag_command_tail 'buildx build --pull' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev' 'octoleo/joomengine:6.0.0-php8.5-apache-dev'
 [[ "$(awk '$13 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$standard_profile_hashes" ]] || fail 'dev refresh changed standard image fingerprints'
 echo 'ok - development base digest updates rebuild only the corresponding profile and flavors'
+
+# Publication refreshes the configured final images even when their own inputs
+# are unchanged. Local build-only runs above remain selective.
+cp "$CASE_DIR/conf/build.json" "$CASE_DIR/conf/build.before-order"
+cp "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/versions.before-order"
+cp "$JOOMENGINE_MCP_XML_FILE" "$CASE_DIR/mcp.before-order.xml"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 24 ]] || fail 'initial profile publication did not build the complete platform matrix'
+assert_default_publication_tail
+assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.5-apache --metadata-file' 'buildx imagetools create'
+echo 'ok - all four default images build and publish last, with normal latest final'
+
+sed -i 's/1\.0\.2/1.0.3/g' "$JOOMENGINE_MCP_XML_FILE"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 14 ]] || fail 'MCP update did not rebuild its twelve images plus the two unchanged normal-flavor defaults'
+assert_default_publication_tail
+echo 'ok - MCP-only publication refreshes the unchanged default JCB images last'
+
+jq '.tags["6.1.3-php8.5-apache-dev"].index_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 4 ]] || fail 'dev-only publication did not rebuild exactly the four default owners'
+assert_default_publication_tail
+echo 'ok - dev-only publication refreshes normal defaults without unrelated rebuilds'
+
+jq '.tags["6.1.3-php8.4-fpm"].index_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
+mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
+before_order_dry_run_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args --dry-run
+[[ ! -s "$TRACE_FILE" ]] || fail 'default-refresh dry-run invoked Docker'
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$before_order_dry_run_hashes" ]] || fail 'default-refresh dry-run committed build state'
+[[ "$(grep -c '^▶ Building octoleo/joomengine:' "$CASE_DIR/engine.out")" -eq 6 ]] || fail 'publication dry-run omitted unchanged final default owners'
+assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev'
+assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-dev'
+assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-mcp'
+assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache'
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 6 ]] || fail 'non-default publication did not rebuild two changed images and four default owners'
+assert_default_publication_tail
+order_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ ! -s "$TRACE_FILE" ]] || fail 'unchanged publication refreshed defaults unnecessarily'
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$order_hashes" ]] || fail 'unchanged publication altered build state'
+echo 'ok - unrelated updates refresh all defaults, while the next publication is a true no-op'
+
+jq '.publishLast = ["latest", "latest-mcp-dev", "6", "latest-dev", "latest-mcp"]' \
+	"$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
+mv "$CASE_DIR/conf/build.next" "$CASE_DIR/conf/build.json"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 24 ]] || fail 'shared final aliases caused a duplicate image build'
+assert_tag_command_tail 'buildx build --pull' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev' \
+	'octoleo/joomengine:6.0.0-php8.5-apache' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-dev' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-mcp'
+assert_tag_command_tail 'buildx imagetools create' \
+	'octoleo/joomengine:latest' 'octoleo/joomengine:latest-mcp-dev' \
+	'octoleo/joomengine:6' 'octoleo/joomengine:latest-dev' 'octoleo/joomengine:latest-mcp'
+echo 'ok - JSON controls final order and shared owners build once at their last configured position'
+
+cp "$CASE_DIR/conf/build.before-order" "$CASE_DIR/conf/build.json"
+for profile in standard dev; do
+	jq --arg profile "$profile" '."6".profiles = [$profile]' \
+		"$CASE_DIR/conf/versions.before-order" > "$CASE_DIR/conf/versions.json"
+	JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+	profile_suffix=""
+	[[ "$profile" != dev ]] || profile_suffix='-dev'
+	assert_tag_command_tail 'buildx build --pull' \
+		"octoleo/joomengine:6.0.0-php8.5-apache-mcp${profile_suffix}" \
+		"octoleo/joomengine:6.0.0-php8.5-apache${profile_suffix}"
+	assert_tag_command_tail 'buildx imagetools create' \
+		"octoleo/joomengine:latest-mcp${profile_suffix}" \
+		"octoleo/joomengine:latest${profile_suffix}"
+done
+jq '."6".variants = ["fpm"]' "$CASE_DIR/conf/versions.before-order" > "$CASE_DIR/conf/versions.json"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+assert_not_contains "$TRACE_FILE" '--tag octoleo/joomengine:latest'
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
+[[ ! -s "$TRACE_FILE" ]] || fail 'FPM-only publication with unavailable defaults was not a no-op'
+echo 'ok - unavailable final aliases are skipped for standard-only, dev-only and FPM-only matrices'
+
+mv "$CASE_DIR/conf/build.before-order" "$CASE_DIR/conf/build.json"
+mv "$CASE_DIR/conf/versions.before-order" "$CASE_DIR/conf/versions.json"
+mv "$CASE_DIR/mcp.before-order.xml" "$JOOMENGINE_MCP_XML_FILE"
 
 jq '.defaultProfile = "dev"' "$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
 mv "$CASE_DIR/conf/build.next" "$CASE_DIR/conf/build.json"

@@ -31,6 +31,8 @@ metadata="$(jq -cn --arg hash "$hash" --arg digest "$digest" '{
 }')"
 
 assert_status 0 image_config_validate "$config" "$maintainers"
+jq '.publishLast = []' "$config" > "$TEST_TMP/no-final-order.json"
+assert_status 0 image_config_validate "$TEST_TMP/no-final-order.json" "$maintainers"
 [[ "$(image_profile_suffix "$config" standard)" == '' ]] || fail 'standard suffix changed'
 [[ "$(image_profile_suffix "$config" dev)" == '-dev' ]] || fail 'dev suffix missing'
 assert_status 2 image_profile_suffix "$config" absent
@@ -94,6 +96,12 @@ printf 'ok - configurations can delegate the administrator password to runtime s
 
 # Configuration and untrusted release metadata fail before emitting a Dockerfile.
 for expression in \
+	'del(.publishLast)' \
+	'.publishLast = "latest"' \
+	'.publishLast = ["latest", "latest"]' \
+	'.publishLast = ["latest\n"]' \
+	'.publishLast = ["repo:latest"]' \
+	'.publishLast = [null]' \
 	'.profiles.dev.suffix = "\nRUN false"' \
 	'.profiles.dev.suffix = ""' \
 	'.defaultProfile = "dev"' \
