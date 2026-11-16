@@ -143,12 +143,14 @@ extension_snapshot() {
 
 verify_cli() {
     local commands major
-    commands="$(docker exec "$application" php cli/joomla.php list --raw)"
+    commands="$(docker exec "$application" php cli/joomla.php list --no-ansi)"
     major="$(docker exec "$application" sh -c 'printf "%s" "${JOOMLA_VERSION%%.*}"')"
     # Historical Joomla 4 packages retain their upstream console capabilities.
     if [[ "$major" -ge 5 ]]; then
-        grep -q '^componentbuilder:' <<< "$commands" ||
+        if ! grep -Eq '^[[:space:]]*componentbuilder:[^[:space:]]+' <<< "$commands"; then
+            printf '%s\n' "$commands" >&2
             fail 'The installed JCB console commands must be available'
+        fi
     fi
 }
 
