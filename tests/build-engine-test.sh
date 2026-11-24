@@ -454,6 +454,11 @@ old_input_sha="$({
 current_input_sha="$(jq -sr '.[0].build_input_sha' "$CASE_DIR/conf/manifest.ndjson")"
 sed -i "s/$current_input_sha/$old_input_sha/g" "$CASE_DIR/conf/hashes.txt" "$CASE_DIR/conf/manifest.ndjson"
 printf '# changed recipe\n' >> "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-mcp/Dockerfile"
+git -C "$CASE_DIR" init --quiet
+git -C "$CASE_DIR" add conf/hashes.txt conf/manifest.ndjson images
+git -C "$CASE_DIR" -c user.name=Fixture -c user.email=fixture@example.test commit --quiet -m 'Previous release'
+run_engine_args --dry-run --build-only
+assert_no_command "$TRACE_FILE" 'buildx'
 run_engine
 [[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 1 ]] || fail 'legacy migration did not distinguish matching and changed recipes'
 assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --load'
