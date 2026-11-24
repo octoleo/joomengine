@@ -70,19 +70,19 @@ assert_tag_command_tail() {
 	[[ "$actual" == "$expected" ]] || fail "$command_prefix has unexpected final tag order: $actual"
 }
 
-assert_default_publication_tail() {
-	assert_tag_command_tail 'buildx build --pull' \
-		'octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev' \
-		'octoleo/joomengine:6.0.0-php8.5-apache-dev' \
-		'octoleo/joomengine:6.0.0-php8.5-apache-mcp' \
-		'octoleo/joomengine:6.0.0-php8.5-apache'
-	assert_tag_command_tail 'buildx imagetools create' \
+assert_alias_tail() {
+	local actual expected
+	expected="$(printf '%s\n' "$@")"
+	actual="$(awk '$1 == "crane" && $2 == "tag" {split($3, ref, "@"); print ref[1] ":" $4}' "$TRACE_FILE" | tail -n "$#")"
+	[[ "$actual" == "$expected" ]] || fail "unexpected final alias order: $actual"
+}
+
+assert_default_alias_tail() {
+	assert_alias_tail \
 		'octoleo/joomengine:latest-mcp-dev' \
 		'octoleo/joomengine:latest-dev' \
 		'octoleo/joomengine:latest-mcp' \
 		'octoleo/joomengine:latest'
-	[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || \
-		fail 'normal latest was not the final registry operation'
 }
 
 assert_text_contains() {
@@ -139,6 +139,27 @@ if [[ "${JOOMENGINE_BUILD_TEST_MOCK:-no}" == "yes" ]]; then
 		printf '%s\n' \
 			"${jcb_major}.0.0|${jcb_url}|stable|$(printf 'a%.0s' {1..128})"
 		;;
+	crane)
+		printf 'crane %s\n' "$*" >> "$JOOMENGINE_DOCKER_TRACE"
+		case "$1" in
+		digest)
+			if [[ -f "$JOOMENGINE_TEST_REGISTRY/${2##*:}" ]]; then
+				cat "$JOOMENGINE_TEST_REGISTRY/${2##*:}"
+			else
+				echo "Error: GET $2: MANIFEST_UNKNOWN: manifest unknown" >&2
+				exit 1
+			fi
+			;;
+		tag)
+			if [[ "${JOOMENGINE_FAIL_ALIAS_CREATE:-no}" == "yes" || "${JOOMENGINE_FAIL_ALIAS_CREATE:-}" == "$3" ]]; then
+				echo 'Error: DENIED: fixture publication failure' >&2
+				exit 1
+			fi
+			printf '%s\n' "${2##*@}" > "$JOOMENGINE_TEST_REGISTRY/$3"
+			;;
+		*) exit 2 ;;
+		esac
+		;;
 	docker)
 		printf '%s\n' "$*" >> "$JOOMENGINE_DOCKER_TRACE"
 		case "${1:-} ${2:-} ${3:-}" in
@@ -174,9 +195,6 @@ if [[ "${JOOMENGINE_BUILD_TEST_MOCK:-no}" == "yes" ]]; then
 						"containerimage.descriptor": {digest: $descriptor_digest}
 					}' > "$metadata_file"
 			fi
-			;;
-		"buildx imagetools create")
-			[[ "${JOOMENGINE_FAIL_ALIAS_CREATE:-no}" != "yes" ]] || exit 1
 			;;
 		"buildx imagetools inspect")
 			if [[ "${4:-}" == "--raw" ]]; then
@@ -247,7 +265,7 @@ mkdir -p \
 	"$CASE_DIR/src/lib" \
 	"$CASE_DIR/src/lib"
 
-cp "$ENGINE" "$CASE_DIR/src/bin/joomengine.sh"
+cp "$ENGINE" "$REPO_ROOT/src/bin/publish-aliases.sh" "$CASE_DIR/src/bin/"
 cp "$REPO_ROOT/src/lib/mcp-package.sh" "$CASE_DIR/src/lib/mcp-package.sh"
 cp "$REPO_ROOT/src/lib/image-config.sh" "$CASE_DIR/src/lib/image-config.sh"
 cp "$REPO_ROOT/src/lib/build-targets.sh" "$CASE_DIR/src/lib/build-targets.sh"
@@ -331,7 +349,9 @@ cat > "$CASE_DIR/conf/upstream-images.json" <<'JSON'
 }
 JSON
 
-for mock_name in curl xmlstarlet docker; do
+export JOOMENGINE_TEST_REGISTRY="$CASE_DIR/registry"
+mkdir "$JOOMENGINE_TEST_REGISTRY"
+for mock_name in curl xmlstarlet docker crane; do
 	make_stub "$mock_name"
 done
 
@@ -420,6 +440,25 @@ run_engine
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$first_hashes" ]] || fail 'no-op changed hash state'
 assert_contains "$CASE_DIR/engine.out" 'No changed image inputs detected'
 echo 'ok - unchanged inputs are a true build no-op'
+
+# Recreate the preceding engine's input fingerprint, including the recipe and
+# context records it committed. Only an identical saved recipe can be migrated.
+# shellcheck source=../src/lib/build-targets.sh
+source "$CASE_DIR/src/lib/build-targets.sh"
+old_input_sha="$({
+	printf '%s\n' '5998782bff5dd841bc5ba5d9afb94eea27e1ff7f4902c8b98d469259cd1e5c2b'
+	sha256sum "$CASE_DIR/src/lib/image-config.sh" "$CASE_DIR/src/lib/build-targets.sh" \
+		"$CASE_DIR/conf/build.json" "$CASE_DIR/conf/maintainers.json" | awk '{print $1}'
+	build_targets_normalize "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/build.json" | jq -cS .
+} | sha256sum | awk '{print $1}')"
+current_input_sha="$(jq -sr '.[0].build_input_sha' "$CASE_DIR/conf/manifest.ndjson")"
+sed -i "s/$current_input_sha/$old_input_sha/g" "$CASE_DIR/conf/hashes.txt" "$CASE_DIR/conf/manifest.ndjson"
+printf '# changed recipe\n' >> "$CASE_DIR/images/jcb6.0.0/j6.1.3/php8.4/apache-mcp/Dockerfile"
+run_engine
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 1 ]] || fail 'legacy migration did not distinguish matching and changed recipes'
+assert_contains "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --load'
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$first_hashes" ]] || fail 'legacy fingerprints were not upgraded'
+echo 'ok - identical legacy recipes migrate and changed recipes rebuild'
 
 # A manual Joomla bump can precede the release detector committing its matching
 # digests. Refresh only that configured matrix before consuming build inputs.
@@ -569,7 +608,7 @@ PATH="$CASE_DIR/bin:$PATH" \
 fi
 assert_contains "$TRACE_FILE" 'buildx build --pull'
 assert_no_command "$TRACE_FILE" 'tag '
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$platform_hashes" ]] || fail 'failed build committed hash state'
 echo 'ok - failed builds never commit hashes or promote aliases'
 
@@ -580,7 +619,7 @@ if JOOMENGINE_EXPECT_FAILURE=yes \
 fi
 assert_contains "$TRACE_FILE" 'buildx build --pull'
 assert_not_contains "$TRACE_FILE" 'imagetools inspect --format {{json .Manifest}}'
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 assert_contains "$CASE_DIR/engine.err" 'inconsistent image digest metadata'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$platform_hashes" ]] || fail 'metadata mismatch committed hash state'
 echo 'ok - inconsistent Buildx output digests block registry verification and aliases'
@@ -593,7 +632,7 @@ fi
 assert_contains "$TRACE_FILE" 'buildx build --pull'
 [[ "$(grep -Fc 'imagetools inspect --format {{json .Manifest}}' "$TRACE_FILE")" -eq 5 ]] || fail 'tag digest verification was not retried five times'
 assert_not_contains "$TRACE_FILE" 'imagetools inspect --raw'
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 assert_contains "$CASE_DIR/engine.err" 'did not resolve to the pushed digest'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$platform_hashes" ]] || fail 'stale mutable tag committed hash state'
 echo 'ok - stale same-platform mutable tags cannot pass exact digest verification'
@@ -609,7 +648,7 @@ if JOOMENGINE_BUILD_TEST_MOCK=yes \
 fi
 assert_contains "$TRACE_FILE" 'buildx inspect --bootstrap'
 assert_not_contains "$TRACE_FILE" 'buildx build --pull'
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 assert_contains "$CASE_DIR/engine.err" 'does not support required platform(s)'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$platform_hashes" ]] || fail 'failed preflight committed hash state'
 echo 'ok - Buildx capability preflight fails before the first image mutation'
@@ -621,7 +660,7 @@ if JOOMENGINE_EXPECT_FAILURE=yes \
 fi
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/386,linux/amd64,linux/arm/v5,linux/arm64/v8'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 assert_no_command "$TRACE_FILE" 'tag '
 assert_contains "$CASE_DIR/engine.err" 'Published platform verification failed'
 [[ "$(grep -Fc 'buildx imagetools inspect --raw' "$TRACE_FILE")" -eq 5 ]] || fail 'registry visibility retry was not bounded to five attempts'
@@ -635,7 +674,7 @@ if JOOMENGINE_EXPECT_FAILURE=yes \
 fi
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/386,linux/amd64,linux/arm/v5,linux/arm64/v8'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 assert_contains "$CASE_DIR/engine.err" 'Published platform verification failed'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$platform_hashes" ]] || fail 'malformed descriptor committed hash state'
 echo 'ok - only recognized provenance attestation descriptors are ignored'
@@ -644,17 +683,17 @@ run_engine_args --force
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/386,linux/amd64,linux/arm/v5,linux/arm64/v8 --tag octoleo/joomengine:6.0.0-php8.4-apache --metadata-file'
 assert_contains "$TRACE_FILE" 'buildx imagetools inspect --format {{json .Manifest}} octoleo/joomengine:6.0.0-php8.4-apache'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
-assert_contains "$TRACE_FILE" "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE"
+assert_contains "$TRACE_FILE" 'crane digest octoleo/joomengine:latest'
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$PUBLISHED_DIGEST" ]] || fail 'latest has the wrong digest'
 assert_no_command "$TRACE_FILE" 'tag '
-assert_command_before "$TRACE_FILE" 'buildx build --pull' 'buildx imagetools create'
+assert_command_before "$TRACE_FILE" 'buildx build --pull' 'crane tag'
 assert_command_before "$TRACE_FILE" 'imagetools inspect --format {{json .Manifest}}' 'buildx imagetools inspect --raw'
 assert_command_before "$TRACE_FILE" 'buildx build --pull' 'buildx imagetools inspect --raw'
-assert_command_before "$TRACE_FILE" 'buildx imagetools inspect --raw' 'buildx imagetools create'
-assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --metadata-file' 'buildx imagetools create'
+assert_command_before "$TRACE_FILE" 'buildx imagetools inspect --raw' 'crane tag'
+assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.4-apache-mcp --metadata-file' 'crane tag'
 assert_tag_command_tail 'buildx build --pull' \
 	'octoleo/joomengine:6.0.0-php8.4-apache-mcp' 'octoleo/joomengine:6.0.0-php8.4-apache'
-[[ "$(tail -2 "$TRACE_FILE" | sed -n '1p')" == "buildx imagetools create --tag octoleo/joomengine:latest-mcp $PUBLISHED_REFERENCE" ]] || fail 'MCP latest was not deferred until the final normal latest'
-[[ "$(tail -1 "$TRACE_FILE")" == "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE" ]] || fail 'plain latest was not the final published alias'
+assert_alias_tail 'octoleo/joomengine:latest-mcp' 'octoleo/joomengine:latest'
 jq -e '
 	.platforms == ["linux/386", "linux/amd64", "linux/arm/v5", "linux/arm64/v8"] and
 	.platform_digests == .base_platforms
@@ -667,7 +706,8 @@ JOOMENGINE_INSPECT_PLATFORMS='linux/amd64,linux/arm64/v8' \
 	run_engine_args --platforms linux/amd64,linux/arm64/v8
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/amd64,linux/arm64/v8 --tag octoleo/joomengine:6.0.0-php8.4-apache --metadata-file'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
-assert_contains "$TRACE_FILE" "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE"
+assert_contains "$TRACE_FILE" 'crane digest octoleo/joomengine:latest'
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$PUBLISHED_DIGEST" ]] || fail 'latest has the wrong digest'
 jq -e '
 	.platforms == ["linux/amd64", "linux/arm64/v8"] and
 	(.platform_digests | keys) == ["linux/amd64", "linux/arm64/v8"]
@@ -685,7 +725,8 @@ JOOMENGINE_INSPECT_SINGLE_PLATFORM=linux/arm \
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/arm/v7 --tag octoleo/joomengine:6.0.0-php8.4-apache --metadata-file'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --format {{json .Image}} $PUBLISHED_REFERENCE"
-assert_contains "$TRACE_FILE" "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE"
+assert_contains "$TRACE_FILE" 'crane digest octoleo/joomengine:latest'
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$PUBLISHED_DIGEST" ]] || fail 'latest has the wrong digest'
 single_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
 [[ "$single_hashes" != "$subset_hashes" ]] || fail 'single-platform publication did not alter hash state'
 echo 'ok - single-manifest publication normalizes implicit ARM v7 configuration'
@@ -719,7 +760,7 @@ printf '# explicit local platform change\n' >> "$CASE_DIR/src/lib/image-config.s
 run_engine_args --build-only --platforms linux/arm64/v8
 assert_contains "$TRACE_FILE" 'buildx build --pull --platform linux/arm64/v8 --tag octoleo/joomengine:6.0.0-php8.4-apache --load'
 assert_contains "$TRACE_FILE" 'tag octoleo/joomengine:6.0.0-php8.4-apache octoleo/joomengine:latest'
-assert_not_contains "$TRACE_FILE" 'imagetools create'
+assert_no_command "$TRACE_FILE" 'crane '
 echo 'ok - explicit local builds load one selected platform and keep aliases local'
 
 JOOMENGINE_TEST_DEFAULT_PLATFORM=linux/arm64 \
@@ -767,33 +808,92 @@ JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 	run_engine_args
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'topology-only promotion did not rebuild the available default owners'
+assert_no_command "$TRACE_FILE" 'buildx build'
 assert_contains "$TRACE_FILE" 'buildx imagetools inspect --format {{json .Manifest}} octoleo/joomengine:6.0.0-php8.4-apache'
 assert_contains "$TRACE_FILE" "buildx imagetools inspect --raw $PUBLISHED_REFERENCE"
-assert_contains "$TRACE_FILE" "buildx imagetools create --tag octoleo/joomengine:latest $PUBLISHED_REFERENCE"
-[[ "$(grep -Fc 'buildx imagetools create' "$TRACE_FILE")" -eq "$expected_alias_count" ]] || fail 'topology-only retry did not promote every desired alias'
+assert_contains "$TRACE_FILE" 'crane digest octoleo/joomengine:latest'
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$PUBLISHED_DIGEST" ]] || fail 'latest has the wrong digest'
+[[ "$(awk '$1 == "crane" && $2 == "digest" && !seen[$3]++ {n++} END {print n}' "$TRACE_FILE")" -eq "$expected_alias_count" ]] || fail 'unknown prior topology must check all desired aliases'
+[[ "$(grep -c '^crane tag ' "$TRACE_FILE")" -eq 2 ]] || fail 'only the configured defaults should be retagged'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$topology_hashes" ]] || fail 'successful topology reconciliation did not commit registry state'
 echo 'ok - dry-run cannot suppress a topology-only registry retry'
 
 failed_topology_sha="$(printf '6%.0s' {1..64})"
 set_alias_topology_hash "$failed_topology_sha"
 failed_topology_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
+rm "$JOOMENGINE_TEST_REGISTRY/latest"
 if JOOMENGINE_EXPECT_FAILURE=yes \
 	JOOMENGINE_FAIL_ALIAS_CREATE=yes \
 	JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 	run_engine_args; then
 	fail 'failed registry alias promotion returned success'
 fi
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'topology retry did not rebuild the available default owners'
-assert_contains "$TRACE_FILE" 'buildx imagetools create'
+assert_no_command "$TRACE_FILE" 'buildx build'
+assert_contains "$TRACE_FILE" 'crane tag'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$failed_topology_hashes" ]] || fail 'failed alias promotion committed registry state'
 
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
 	run_engine_args
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'failed topology promotion retry did not rebuild the available default owners'
-[[ "$(grep -Fc 'buildx imagetools create' "$TRACE_FILE")" -eq "$expected_alias_count" ]] || fail 'failed alias promotion suppressed its retry'
+assert_no_command "$TRACE_FILE" 'buildx build'
+[[ "$(grep -Fc 'crane tag' "$TRACE_FILE")" -eq 2 ]] || fail 'retry rewrote an ordinary alias'
+assert_contains "$TRACE_FILE" "crane tag $PUBLISHED_REFERENCE latest"
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$topology_hashes" ]] || fail 'alias retry did not commit reconciled topology state'
 echo 'ok - failed alias promotion leaves topology pending for retry'
+
+# Reproduce a package release with an unchanged older version in the catalogue.
+# The publish job can start from the prepared digests even after a partial failure.
+cp "$CASE_DIR/conf/manifest.ndjson" "$CASE_DIR/before-release.ndjson"
+release_feed="$CASE_DIR/two-releases.txt"
+for release in 6.0.0 6.0.1; do
+	printf '%s|%s|stable|%s\n' "$release" "$(<"$CASE_DIR/jcb-url")" "$(printf 'a%.0s' {1..128})"
+done > "$release_feed"
+release_digest="sha256:$(printf '8%.0s' {1..64})"
+plan_dir="$CASE_DIR/publication"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" \
+	JOOMENGINE_JCB_RELEASES_FILE="$release_feed" \
+	JOOMENGINE_BUILD_OUTPUT_DIGEST="$release_digest" \
+	run_engine_args --prepare-publication "$plan_dir"
+assert_no_command "$TRACE_FILE" 'crane '
+[[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$topology_hashes" ]] || fail 'preparation advanced published state'
+assert_contains "$plan_dir/hashes.txt" '6.0.1 '
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'release rebuilt existing versions'
+jq -r 'select(.version == "6.0.1") | . as $r | .tags[] | select(. != $r.base_tag) | $r.image + ":" + .' \
+	"$CASE_DIR/conf/manifest.ndjson" | sort > "$CASE_DIR/release-aliases"
+grep -vxF '# publish-last' "$plan_dir/aliases.tsv" | cut -f1 | sort | diff -u "$CASE_DIR/release-aliases" - || fail 'new release scheduled historical or missing aliases'
+awk -F '\t' -v source="octoleo/joomengine@${release_digest}" '$0 == "# publish-last" {next} NF != 2 || $2 != source {exit 1}' \
+	"$plan_dir/aliases.tsv" || fail 'release plan did not pin verified multi-platform digests'
+
+run_publisher() {
+	: > "$TRACE_FILE"
+	JOOMENGINE_BUILD_TEST_MOCK=yes JOOMENGINE_DOCKER_TRACE="$TRACE_FILE" PATH="$CASE_DIR/bin:$PATH" \
+		"$CASE_DIR/src/bin/publish-aliases.sh" "$plan_dir/aliases.tsv"
+}
+if JOOMENGINE_FAIL_ALIAS_CREATE=latest run_publisher > "$CASE_DIR/publish.out" 2>&1; then
+	fail 'failed publication from a prepared plan returned success'
+fi
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$PUBLISHED_DIGEST" ]] || fail 'failed latest write changed its digest'
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest-mcp")" == "$release_digest" ]] || fail 'completed alias was not published'
+run_publisher > "$CASE_DIR/publish.out"
+assert_no_command "$TRACE_FILE" 'buildx'
+[[ "$(grep -c '^crane tag ' "$TRACE_FILE")" -eq 2 ]] || fail 'retry rewrote an ordinary alias'
+assert_contains "$TRACE_FILE" "crane tag octoleo/joomengine@${release_digest} latest"
+[[ "$(<"$JOOMENGINE_TEST_REGISTRY/latest")" == "$release_digest" ]] || fail 'retried latest write has wrong digest'
+echo 'ok - a new release prepares only changed aliases and retries from verified digests without rebuilding'
+# If the newest release is withdrawn, the moving aliases return to a canonical
+# image which was already built. Its own version-specific tags stay untouched.
+cp "$plan_dir/hashes.txt" "$CASE_DIR/conf/hashes.txt"
+restored_plan="$CASE_DIR/restored-publication"
+JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args --prepare-publication "$restored_plan"
+assert_no_command "$TRACE_FILE" 'buildx build'
+assert_no_command "$TRACE_FILE" 'crane '
+jq -r '. as $r | .tags[] | select(. != $r.base_tag) | $r.image + ":" + .' \
+	"$CASE_DIR/before-release.ndjson" | sort > "$CASE_DIR/previous-aliases"
+comm -12 "$CASE_DIR/previous-aliases" "$CASE_DIR/release-aliases" > "$CASE_DIR/moved-aliases"
+grep -vxF '# publish-last' "$restored_plan/aliases.tsv" | cut -f1 | sort | diff -u "$CASE_DIR/moved-aliases" - || fail 'owner change republished untouched aliases'
+[[ "$(<"$restored_plan/hashes.txt")" == "$topology_hashes" ]] || fail 'restored release did not recover the original input state'
+cp "$restored_plan/hashes.txt" "$CASE_DIR/conf/hashes.txt"
+echo 'ok - aliases can move to an already published image without rebuilding or touching unrelated tags'
+mv "$CASE_DIR/before-release.ndjson" "$CASE_DIR/conf/manifest.ndjson"
 
 jq -nc '{
 	image: "octoleo/joomengine",
@@ -923,30 +1023,34 @@ assert_tag_command_tail 'buildx build --pull' \
 [[ "$(awk '$13 == "standard" { print }' "$CASE_DIR/conf/hashes.txt")" == "$standard_profile_hashes" ]] || fail 'dev refresh changed standard image fingerprints'
 echo 'ok - development base digest updates rebuild only the corresponding profile and flavors'
 
-# Publication refreshes the configured final images even when their own inputs
-# are unchanged. Local build-only runs above remain selective.
+# Every nonempty publication checks the defaults last and builds only affected images.
 cp "$CASE_DIR/conf/build.json" "$CASE_DIR/conf/build.before-order"
 cp "$CASE_DIR/conf/versions.json" "$CASE_DIR/conf/versions.before-order"
 cp "$JOOMENGINE_MCP_XML_FILE" "$CASE_DIR/mcp.before-order.xml"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
 [[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 24 ]] || fail 'initial profile publication did not build the complete platform matrix'
-assert_default_publication_tail
-assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.5-apache --metadata-file' 'buildx imagetools create'
+assert_tag_command_tail 'buildx build --pull' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-dev' \
+	'octoleo/joomengine:6.0.0-php8.5-apache-mcp' \
+	'octoleo/joomengine:6.0.0-php8.5-apache'
+assert_default_alias_tail
+assert_command_before "$TRACE_FILE" '--tag octoleo/joomengine:6.0.0-php8.5-apache --metadata-file' 'crane digest'
 echo 'ok - all four default images build and publish last, with normal latest final'
 
 sed -i 's/1\.0\.2/1.0.3/g' "$JOOMENGINE_MCP_XML_FILE"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 14 ]] || fail 'MCP update did not rebuild its twelve images plus the two unchanged normal-flavor defaults'
-assert_default_publication_tail
-echo 'ok - MCP-only publication refreshes the unchanged default JCB images last'
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 12 ]] || fail 'MCP update rebuilt unchanged plain images'
+assert_default_alias_tail
+echo 'ok - MCP-only publication updates only MCP images and checks all defaults last'
 
 jq '.tags["6.1.3-php8.5-apache-dev"].index_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
 	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
 mv "$CASE_DIR/conf/upstream-images.next" "$CASE_DIR/conf/upstream-images.json"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 4 ]] || fail 'dev-only publication did not rebuild exactly the four default owners'
-assert_default_publication_tail
-echo 'ok - dev-only publication refreshes normal defaults without unrelated rebuilds'
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'dev-only publication rebuilt standard images'
+assert_default_alias_tail
+echo 'ok - dev-only publication updates only dev images and checks all defaults last'
 
 jq '.tags["6.1.3-php8.4-fpm"].index_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
 	"$CASE_DIR/conf/upstream-images.json" > "$CASE_DIR/conf/upstream-images.next"
@@ -955,19 +1059,16 @@ before_order_dry_run_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args --dry-run
 [[ ! -s "$TRACE_FILE" ]] || fail 'default-refresh dry-run invoked Docker'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$before_order_dry_run_hashes" ]] || fail 'default-refresh dry-run committed build state'
-[[ "$(grep -c '^▶ Building octoleo/joomengine:' "$CASE_DIR/engine.out")" -eq 6 ]] || fail 'publication dry-run omitted unchanged final default owners'
-assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-mcp-dev'
-assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-dev'
-assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache-mcp'
-assert_contains "$CASE_DIR/engine.out" '▶ Building octoleo/joomengine:6.0.0-php8.5-apache'
+[[ "$(grep -c '^▶ Building octoleo/joomengine:' "$CASE_DIR/engine.out")" -eq 2 ]] || fail 'dry-run scheduled unrelated builds'
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
-[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 6 ]] || fail 'non-default publication did not rebuild two changed images and four default owners'
-assert_default_publication_tail
+[[ "$(grep -Fc 'buildx build --pull' "$TRACE_FILE")" -eq 2 ]] || fail 'non-default publication rebuilt unaffected defaults'
+assert_default_alias_tail
+[[ "$(grep -c '^crane tag ' "$TRACE_FILE")" -eq 4 ]] || fail 'matching ordinary aliases were rewritten'
 order_hashes="$(<"$CASE_DIR/conf/hashes.txt")"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
 [[ ! -s "$TRACE_FILE" ]] || fail 'unchanged publication refreshed defaults unnecessarily'
 [[ "$(<"$CASE_DIR/conf/hashes.txt")" == "$order_hashes" ]] || fail 'unchanged publication altered build state'
-echo 'ok - unrelated updates refresh all defaults, while the next publication is a true no-op'
+echo 'ok - unrelated updates retag defaults without rebuilding and the next publication is a true no-op'
 
 jq '.publishLast = ["latest", "latest-mcp-dev", "6", "latest-dev", "latest-mcp"]' \
 	"$CASE_DIR/conf/build.json" > "$CASE_DIR/conf/build.next"
@@ -979,7 +1080,7 @@ assert_tag_command_tail 'buildx build --pull' \
 	'octoleo/joomengine:6.0.0-php8.5-apache' \
 	'octoleo/joomengine:6.0.0-php8.5-apache-dev' \
 	'octoleo/joomengine:6.0.0-php8.5-apache-mcp'
-assert_tag_command_tail 'buildx imagetools create' \
+assert_alias_tail \
 	'octoleo/joomengine:latest' 'octoleo/joomengine:latest-mcp-dev' \
 	'octoleo/joomengine:6' 'octoleo/joomengine:latest-dev' 'octoleo/joomengine:latest-mcp'
 echo 'ok - JSON controls final order and shared owners build once at their last configured position'
@@ -994,13 +1095,13 @@ for profile in standard dev; do
 	assert_tag_command_tail 'buildx build --pull' \
 		"octoleo/joomengine:6.0.0-php8.5-apache-mcp${profile_suffix}" \
 		"octoleo/joomengine:6.0.0-php8.5-apache${profile_suffix}"
-	assert_tag_command_tail 'buildx imagetools create' \
+	assert_alias_tail \
 		"octoleo/joomengine:latest-mcp${profile_suffix}" \
 		"octoleo/joomengine:latest${profile_suffix}"
 done
 jq '."6".variants = ["fpm"]' "$CASE_DIR/conf/versions.before-order" > "$CASE_DIR/conf/versions.json"
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
-assert_not_contains "$TRACE_FILE" '--tag octoleo/joomengine:latest'
+assert_not_contains "$TRACE_FILE" 'crane digest octoleo/joomengine:latest'
 JOOMENGINE_INSPECT_PLATFORMS="$AUTO_PLATFORMS" run_engine_args
 [[ ! -s "$TRACE_FILE" ]] || fail 'FPM-only publication with unavailable defaults was not a no-op'
 echo 'ok - unavailable final aliases are skipped for standard-only, dev-only and FPM-only matrices'

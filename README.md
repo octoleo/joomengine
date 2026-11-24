@@ -232,9 +232,16 @@ current matrix without advancing Joomla releases:
 ./src/bin/check-joomla-releases.sh --refresh-current
 ```
 
-The publisher builds changed images, verifies their multi-platform publication,
-and promotes rolling/default aliases only after all required builds succeed.
-Successful build state is committed only after that publication completes.
+The build job pushes each changed versioned image and verifies its registry
+digest and platforms. It saves an artifact containing the ordered alias-to-digest
+plan and the pending changes to the generated files. A separate job publishes
+the aliases and commits the generated state after the final tag succeeds.
+
+If Docker Hub throttles tag publication, the publisher retries with backoff.
+If the publish job still fails, select **Re-run failed jobs** on that Actions
+run. GitHub reuses the successful build job's artifact. The publisher checks
+the registry and resumes the remaining tags. If a newer commit has reached
+the default branch, start a fresh run for the current commit.
 
 `conf/build.json` controls the final build and alias-publication order with
 `publishLast`, listed from first to last:
@@ -243,19 +250,25 @@ Successful build state is committed only after that publication completes.
 "publishLast": ["latest-mcp-dev", "latest-dev", "latest-mcp", "latest"]
 ```
 
-Whenever a publishing run has any image or alias update, it rebuilds the images
-owning these aliases after all other changed images, even if their own inputs
-are unchanged. It then publishes all other aliases before this final sequence,
-leaving normal JCB `latest` as the last build and the last tag published.
-BuildKit may reuse unchanged layers. A completely unchanged run does nothing.
-Aliases absent from the selected matrix are skipped; shared image owners build
-once at their last configured position. An empty array disables this policy.
-`--dry-run` shows this plan; `--build-only` orders its changed images the same
-way but does not force unchanged defaults or publish to the registry.
+Only images with changed inputs need a build. An alias whose owner changes
+can reuse the verified digest of an existing versioned image. The publisher
+uses `crane tag` to reuse the complete multi-platform index in the same
+repository. Ordinary aliases are processed first, followed by the configured
+defaults in order. A completely unchanged run performs no registry writes.
+Docker always selects `latest` for an untagged pull.
 
-This controls registry publication order. Docker Hub controls its display order;
-Docker itself always uses `latest` when no tag is supplied, regardless of which
-image was pushed most recently.
+### Recover the defaults from an earlier failed run
+
+For a run that pushed the versioned images before publication checkpoints
+were available, open **JoomEngine – Automated Build & Version Tracking**,
+choose **Run workflow** on the default branch, and enter the failed build's
+numeric **job ID** in `recover_defaults_from_job`. The job ID is the number
+after `/job/` in its GitHub URL.
+
+Recovery checks the current default-tag owners against the previous job's
+verified digests and the live versioned tags, then publishes the configured
+defaults. Run the normal workflow with the input empty to reconcile the
+remaining aliases and commit the full release state.
 
 ## Tag policy
 
@@ -317,6 +330,8 @@ Run the deterministic suite locally with:
 ```
 
 Normal publication defaults to every platform verified for each base image.
+Publishing locally requires `crane` on your PATH and Docker Hub write access
+through `docker login`. Dry runs and local-only builds use the existing tooling.
 `--build-only` loads one platform locally; `--platforms` selects an explicit
 supported subset. `--force` regenerates contexts and `--quiet` suppresses stdout.
 Run `./src/bin/joomengine.sh --help` for the complete options.

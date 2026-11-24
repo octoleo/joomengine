@@ -5,6 +5,11 @@ on:
     types: [pkg-component-builder-updated, pkg-joomengine-mcp-updated]
 
   workflow_dispatch:
+    inputs:
+      recover_defaults_from_job:
+        description: "Optional failed publisher job ID for recovering only the four verified default tags"
+        type: string
+        required: false
 
   push:
     branches: [master]
@@ -15,24 +20,31 @@ on:
       - "conf/versions.json"
       - "conf/upstream-images.json"
       - "src/bin/check-joomla-releases.sh"
+      - "src/bin/install-crane.sh"
       - "src/bin/joomengine.sh"
+      - "src/bin/publish-aliases.sh"
+      - "src/bin/recover-defaults.sh"
       - "src/lib/**"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: joomengine-publish
   cancel-in-progress: false
 
+env:
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  RECOVERY_JOB: ${{ inputs.recover_defaults_from_job }}
+
 jobs:
-  build-and-publish:
+  build-and-prepare:
     name: Build changed image inputs
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
-    env:
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    permissions:
+      contents: read
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -40,27 +52,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check release revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" || "$GITHUB_SHA" != "$(git rev-parse FETCH_HEAD)" ]]; then
+            echo "::error::Start a new run on the current default branch to publish images."
+            exit 1
+          fi
+
       - name: Install required tooling
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            curl \
-            jq \
-            xmlstarlet
+          sudo apt-get install -y curl jq xmlstarlet
 
       - name: Run deterministic unit tests
         shell: bash
-        run: |
-          set -euo pipefail
-          ./tests/run.sh
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        run: ./tests/run.sh
 
       - name: Authenticate with Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -68,30 +79,80 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and publish changed images
+      - name: Set up QEMU
+        if: env.RECOVERY_JOB == ''
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        if: env.RECOVERY_JOB == ''
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build changed canonical images and prepare aliases
+        if: env.RECOVERY_JOB == ''
+        shell: bash
+        run: ./src/bin/joomengine.sh --prepare-publication "$RUNNER_TEMP/publication"
+
+      - name: Read failed publication log for default-tag recovery
+        if: env.RECOVERY_JOB != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RECOVERY_JOB" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Expected a numeric job ID"; exit 1; }
+          api="repos/$GITHUB_REPOSITORY/actions"
+          gh api "$api/jobs/$RECOVERY_JOB" > "$RUNNER_TEMP/prior-job.json"
+          run_id="$(jq -er 'select(.name == "Build changed image inputs" and .conclusion == "failure") | .run_id' "$RUNNER_TEMP/prior-job.json")"
+          gh api "$api/runs/$run_id" > "$RUNNER_TEMP/prior-run.json"
+          source_sha="$(jq -er --arg repo "$GITHUB_REPOSITORY" --arg branch "$DEFAULT_BRANCH" '
+            select(.path == ".github/workflows/joomengine.yml" and .conclusion == "failure" and
+              .head_repository.full_name == $repo and .head_branch == $branch and
+              (.event == "push" or .event == "repository_dispatch" or .event == "workflow_dispatch")) |
+            .head_sha
+          ' "$RUNNER_TEMP/prior-run.json")"
+          git merge-base --is-ancestor "$source_sha" HEAD
+          git diff --quiet "$source_sha" HEAD -- conf/hashes.txt conf/manifest.ndjson || {
+            echo "::error::A newer publication changed the recorded image state."
+            exit 1
+          }
+          last_success="$(gh api --method GET "$api/workflows/joomengine.yml/runs" \
+            -f branch="$DEFAULT_BRANCH" -f status=success -F per_page=1 --jq '.workflow_runs[0].run_number // 0')"
+          if ((last_success > $(jq -r .run_number "$RUNNER_TEMP/prior-run.json"))); then
+            echo "::error::A newer successful publisher superseded that job."
+            exit 1
+          fi
+          gh api "$api/jobs/$RECOVERY_JOB/logs" > "$RUNNER_TEMP/prior-job.log"
+
+      - name: Install crane for recovery
+        if: env.RECOVERY_JOB != ''
+        run: ./src/bin/install-crane.sh
+
+      - name: Prepare verified default-tag recovery
+        if: env.RECOVERY_JOB != ''
         shell: bash
         run: |
           set -euo pipefail
-          ./src/bin/joomengine.sh
+          ./src/bin/joomengine.sh --dry-run
+          mkdir -p "$RUNNER_TEMP/publication"
+          ./src/bin/recover-defaults.sh "$RUNNER_TEMP/prior-job.log" "$RUNNER_TEMP/publication/aliases.tsv"
 
-      - name: Validate generated changes
-        id: generated
+      - name: Checkpoint candidate repository state
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t status_lines < <(
-            git -c status.renames=false status \
-              --porcelain=v1 \
-              --untracked-files=all
-          )
-
-          changed=no
+          checkpoint="$RUNNER_TEMP/publication"
+          test -f "$checkpoint/aliases.tsv"
+          # Recovery publishes only the four default tags, never the generated dry-run files.
+          if [[ -n "$RECOVERY_JOB" ]]; then
+            : > "$checkpoint/state.patch"
+            exit 0
+          fi
+          cp -- "$checkpoint/hashes.txt" conf/hashes.txt
+          mapfile -t status_lines < <(git -c status.renames=false status --porcelain=v1 --untracked-files=all)
           for status_line in "${status_lines[@]}"; do
             path="${status_line:3}"
             case "$path" in
-              conf/hashes.txt|conf/manifest.ndjson|conf/upstream-images.json|images/*)
-                changed=yes
-                ;;
+              conf/hashes.txt|conf/manifest.ndjson|conf/upstream-images.json|images/*) ;;
               *)
                 echo "Unexpected build-engine mutation: $path" >&2
                 git status --short >&2
@@ -100,30 +161,81 @@ jobs:
             esac
           done
 
-          git diff --check -- conf/hashes.txt conf/manifest.ndjson conf/upstream-images.json images
           jq -e . conf/manifest.ndjson >/dev/null
           jq -e . conf/upstream-images.json >/dev/null
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          git add -- conf/hashes.txt conf/manifest.ndjson conf/upstream-images.json images
+          git diff --cached --check
+          git diff --cached --binary --full-index > "$checkpoint/state.patch"
 
-      - name: Commit generated image state
-        if: steps.generated.outputs.changed == 'yes'
+      - name: Save publication checkpoint
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-publication
+          path: |
+            ${{ runner.temp }}/publication/aliases.tsv
+            ${{ runner.temp }}/publication/state.patch
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  publish:
+    name: Publish aliases and record image state
+    needs: build-and-prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download this run's prepared publication
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: image-publication
+          path: ${{ runner.temp }}/publication
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+
+      - name: Install crane
+        run: ./src/bin/install-crane.sh
+
+      - name: Authenticate with Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check release revision and restore candidate state
         shell: bash
         run: |
           set -euo pipefail
-          build_date="$(date -u +'%Y-%m-%d')"
+          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_SHA" != "$(git rev-parse FETCH_HEAD)" ]]; then
+            echo "::error::The default branch advanced. Start a new run on its current revision."
+            exit 1
+          fi
+          patch="$RUNNER_TEMP/publication/state.patch"
+          test -f "$patch"
+          if [[ -s "$patch" ]]; then
+            git apply --index "$patch"
+            git diff --cached --check
+          fi
+
+      - name: Publish prepared aliases
+        run: ./src/bin/publish-aliases.sh "$RUNNER_TEMP/publication/aliases.tsv"
+
+      - name: Commit generated image state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet; then
+            echo "No generated repository changes to commit."
+            exit 0
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -- conf/hashes.txt conf/manifest.ndjson conf/upstream-images.json images
-          git diff --cached --check
-          git commit -m "chore(images): refresh generated contexts (${build_date})"
-
-          git fetch origin "$DEFAULT_BRANCH"
-          git rebase "origin/$DEFAULT_BRANCH"
-          git push origin "HEAD:$DEFAULT_BRANCH"
-
-      - name: Record no-op result
-        if: steps.generated.outputs.changed == 'no'
-        shell: bash
-        run: echo "No generated repository changes detected."
+          git commit -m "chore(images): refresh generated contexts ($(date -u +'%Y-%m-%d'))"
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"

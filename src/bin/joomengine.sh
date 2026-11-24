@@ -23,6 +23,7 @@ fi
 QUIET="no"
 DRY_RUN="no"
 BUILD_ONLY="no"
+PREPARE_PUBLICATION_DIR=""
 FORCE_UPDATE="no"
 PLATFORMS_SPEC="auto"
 BUILD_CONFIG_FILE="$REPO_ROOT/conf/build.json"
@@ -36,6 +37,9 @@ Options:
   -n, --dry-run      Generate/review contexts without building or changing hashes
   -f, --force        Force update docker folder/files
       --build-only   Build images locally, do not push
+      --prepare-publication DIR
+                     Push verified versioned images and save DIR/aliases.tsv plus candidate
+                     DIR/hashes.txt. Commit these hashes only after publishing the alias plan.
       --platforms    Platforms to build: auto or a comma-separated Linux subset
       --config-file  Image-generation JSON configuration (default: conf/build.json)
   -h, --help         Show this help and exit
@@ -85,6 +89,11 @@ while [[ $# -gt 0 ]]; do
 			PLATFORMS_SPEC="${1#*=}"
 			shift
 			;;
+		--prepare-publication)
+			[[ $# -ge 2 && -n "$2" ]] || { echo '[ERROR] --prepare-publication requires a directory' >&2; exit 1; }
+			PREPARE_PUBLICATION_DIR="$(realpath -m -- "$2")"
+			shift 2
+			;;
 		--config-file)
 			[[ $# -ge 2 ]] || { echo '[ERROR] --config-file requires a path' >&2; exit 1; }
 			BUILD_CONFIG_FILE="$(realpath "$2")"
@@ -101,6 +110,15 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+if [[ -n "$PREPARE_PUBLICATION_DIR" && ( "$DRY_RUN" == "yes" || "$BUILD_ONLY" == "yes" ) ]]; then
+	echo '[ERROR] --prepare-publication requires a registry build' >&2
+	exit 1
+fi
+if [[ "$PREPARE_PUBLICATION_DIR" == "$REPO_ROOT/conf" ]]; then
+	echo '[ERROR] Choose a publication directory separate from conf' >&2
+	exit 1
+fi
 
 validate_platform_name() {
 	local platform="$1"
@@ -351,7 +369,10 @@ NEXT_BUILD_MANIFEST_FILE="$(mktemp "${BUILD_MANIFEST_FILE}.next.XXXXXX")"
 # --------------------------------------------------
 touch "$HASHES_FILE"
 NEXT_HASHES_FILE="$(mktemp "${HASHES_FILE}.next.XXXXXX")"
-trap 'rm -f -- "$NEXT_HASHES_FILE" "$PREVIOUS_BUILD_MANIFEST_FILE" "$NEXT_BUILD_MANIFEST_FILE"' EXIT
+mkdir -p -- "${PREPARE_PUBLICATION_DIR:-$LOG_PATH}"
+PUBLICATION_PLAN="$(mktemp "${PREPARE_PUBLICATION_DIR:-$LOG_PATH}/.aliases.XXXXXX")"
+CANDIDATE_DOCKERFILE="$(mktemp "$LOG_PATH/Dockerfile.XXXXXX")"
+trap 'rm -f -- "$NEXT_HASHES_FILE" "$PREVIOUS_BUILD_MANIFEST_FILE" "$NEXT_BUILD_MANIFEST_FILE" "$PUBLICATION_PLAN" "$CANDIDATE_DOCKERFILE"' EXIT
 declare -a STORED_ALIAS_TOPOLOGY_LINES=()
 mapfile -t STORED_ALIAS_TOPOLOGY_LINES < <(
 	awk '$1 == "alias-topology" { print }' "$HASHES_FILE"
@@ -371,10 +392,10 @@ fi
 
 # Any change to these inputs changes the generated image even if the upstream
 # Joomla and JCB versions remain the same.
-BUILD_INPUT_SHA="$(
+build_input_sha() {
 	{
+		printf '%s\n' "$1"
 		for input_file in \
-			"$SCRIPT_PATH" \
 			"$IMAGE_CONFIG_HELPER" \
 			"$BUILD_TARGETS_HELPER" \
 			"$BUILD_CONFIG_FILE" \
@@ -385,7 +406,11 @@ BUILD_INPUT_SHA="$(
 		# package bytes. Rebuild the configured publication when its JSON changes.
 		jq -cS . <<< "$NORMALIZED_TARGETS_JSON"
 	} | sha256sum | awk '{ print $1 }'
-)"
+}
+BUILD_INPUT_SHA="$(build_input_sha "$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')")"
+# The previous publisher included its own script bytes in every image fingerprint.
+# Migrate only exact previous input records whose saved recipe and image name also match.
+LEGACY_BUILD_INPUT_SHA="$(build_input_sha 5998782bff5dd841bc5ba5d9afb94eea27e1ff7f4902c8b98d469259cd1e5c2b)"
 
 get_base_image_index_digest() {
 	local tag="$1"
@@ -530,6 +555,8 @@ declare -a REL_TARGET REL_MAJOR REL_VERSION REL_URL REL_TAG REL_SHA REL_INPUT_SH
 declare -A PHP_LIST_BY_TARGET VARIANT_LIST_BY_TARGET PROFILE_LIST_BY_TARGET HIGHEST_PHP_BY_TARGET
 declare -A JCB_ROWS_BY_MAJOR TARGET_TAG_POLICY TARGET_CHANNEL TARGET_JCB_SELECTOR
 declare -A PENDING_BUILDS MCP_COMPATIBLE
+declare -A MIGRATED_CONTEXT_KEYS=()
+declare -A PREVIOUS_CONTEXT_IMAGES=()
 PENDING_BUILD_COUNT=0
 EXPECTED_MANIFEST_RECORD_COUNT=0
 
@@ -748,15 +775,6 @@ for i in "${!REL_VERSION[@]}"; do
 						continue
 					fi
 
-					PENDING_BUILDS["$BUILD_KEY"]=1
-					PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
-
-					mkdir -p "$target_dir"
-
-					echo "  -> generating ${target}"
-
-					# Remove the old generated adapter when migrating an existing context.
-					rm -f -- "${target_dir}/docker-entrypoint.sh"
 					IMAGE_METADATA="$(jq -cn \
 						--arg joomla "$JOOMLA_VERSION" --arg php "$PHP" \
 						--arg variant "$VARIANT" --arg profile "$PROFILE" \
@@ -768,7 +786,21 @@ for i in "${!REL_VERSION[@]}"; do
 					{
 						generated_warning
 						image_render_dockerfile "$BUILD_CONFIG_FILE" "$MAINTAINERS_JSON_FILE" "$IMAGE_METADATA"
-					} > "${target_dir}/Dockerfile"
+					} > "$CANDIDATE_DOCKERFILE"
+
+					legacy_record="${HASH_RECORD/ "$BUILD_INPUT_SHA" / "$LEGACY_BUILD_INPUT_SHA" }"
+					if [[ "$FORCE_UPDATE" == "no" && ! -e "${target_dir}/docker-entrypoint.sh" ]] && \
+					   grep -Fxq -- "$legacy_record" "$HASHES_FILE" && \
+					   cmp -s -- "$CANDIDATE_DOCKERFILE" "${target_dir}/Dockerfile"; then
+						MIGRATED_CONTEXT_KEYS["$target"]="$BUILD_KEY"
+					else
+						echo "  -> generating ${target}"
+						PENDING_BUILDS["$BUILD_KEY"]=1
+						PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
+						mkdir -p "$target_dir"
+						rm -f -- "${target_dir}/docker-entrypoint.sh"
+						cat "$CANDIDATE_DOCKERFILE" > "${target_dir}/Dockerfile"
+					fi
 
 					printf '%s\n' "$HASH_RECORD" >> "$NEXT_HASHES_FILE"
 				done
@@ -1192,9 +1224,19 @@ declare -A NEW_ALIAS_BASE=()
 declare -A NEW_ALIAS_RECORD=()
 declare -A NEW_BASE_RECORD=()
 declare -A PENDING_BASE_IMAGES=()
+declare -A PENDING_ALIASES=()
 PENDING_ALIAS_PROMOTION_COUNT=0
 NEW_ALIAS_TOPOLOGY_SHA=""
-ALIAS_TOPOLOGY_CHANGED="no"
+
+alias_topology_sha() {
+	local -n owners="$1"
+	local alias
+	{
+		for alias in "${!owners[@]}"; do
+			printf '%s\t%s\n' "$alias" "${owners[$alias]}"
+		done
+	} | sort | sha256sum | awk '{ print $1 }'
+}
 
 load_previous_alias_topology() {
 	local line
@@ -1203,6 +1245,7 @@ load_previous_alias_topology() {
 	local tag
 	local full_base_image
 	local full_tag
+	local context previous_input_sha
 
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ -z "$line" ]] && continue
@@ -1211,8 +1254,11 @@ load_previous_alias_topology() {
 			return 1
 		fi
 
-		read -r image base_tag < <(jq -r '[.image, .base_tag] | @tsv' <<< "$line")
+		read -r image base_tag context previous_input_sha < <(jq -r '[.image, .base_tag, .context, .build_input_sha] | @tsv' <<< "$line")
 		full_base_image="${image}:${base_tag}"
+		if [[ "$previous_input_sha" == "$LEGACY_BUILD_INPUT_SHA" && -n "$context" ]]; then
+			PREVIOUS_CONTEXT_IMAGES["$context"]="$full_base_image"
+		fi
 		while IFS= read -r tag; do
 			full_tag="${image}:${tag}"
 			[[ "$full_tag" == "$full_base_image" ]] && continue
@@ -1233,7 +1279,7 @@ load_new_alias_topology() {
 	local tag
 	local full_base_image
 	local full_tag
-	local -a sorted_aliases=()
+	local context migrated_key
 
 	# First register every immutable base tag so no rolling alias can silently
 	# claim another record's immutable name.
@@ -1244,8 +1290,13 @@ load_new_alias_topology() {
 			echo "[ERROR] Invalid generated build manifest record" >&2
 			return 1
 		fi
-		read -r image base_tag < <(jq -r '[.image, .base_tag] | @tsv' <<< "$line")
+		read -r image base_tag context < <(jq -r '[.image, .base_tag, .context] | @tsv' <<< "$line")
 		full_base_image="${image}:${base_tag}"
+		migrated_key="${MIGRATED_CONTEXT_KEYS[$context]:-}"
+		if [[ -n "$migrated_key" && "${PREVIOUS_CONTEXT_IMAGES[$context]:-}" != "$full_base_image" ]]; then
+			PENDING_BUILDS["$migrated_key"]=1
+			PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
+		fi
 		if [[ -n "${NEW_BASE_RECORD[$full_base_image]:-}" ]] && \
 		   [[ "${NEW_BASE_RECORD[$full_base_image]}" != "$line" ]]; then
 			echo "[ERROR] Conflicting immutable base ownership for $full_base_image" >&2
@@ -1279,34 +1330,21 @@ load_new_alias_topology() {
 		done < <(jq -r '.tags[]' <<< "$line")
 	done < "$BUILD_MANIFEST_FILE"
 
-	if [[ "${#NEW_ALIAS_BASE[@]}" -gt 0 ]]; then
-		mapfile -t sorted_aliases < <(printf '%s\n' "${!NEW_ALIAS_BASE[@]}" | sort)
-	fi
-	NEW_ALIAS_TOPOLOGY_SHA="$({
-		for full_tag in "${sorted_aliases[@]}"; do
-			printf '%s\t%s\n' "$full_tag" "${NEW_ALIAS_BASE[$full_tag]}"
-		done
-	} | sha256sum | awk '{ print $1 }')"
-
-	if [[ "$OLD_ALIAS_TOPOLOGY_SHA" != "$NEW_ALIAS_TOPOLOGY_SHA" ]]; then
-		ALIAS_TOPOLOGY_CHANGED="yes"
-	fi
-	count_pending_alias_promotions
-}
-
-count_pending_alias_promotions() {
-	local full_tag full_base_image
-	PENDING_ALIAS_PROMOTION_COUNT=0
-	if [[ "$ALIAS_TOPOLOGY_CHANGED" == "yes" ]]; then
-		PENDING_ALIAS_PROMOTION_COUNT="${#NEW_ALIAS_BASE[@]}"
-	else
-		for full_tag in "${!NEW_ALIAS_BASE[@]}"; do
-			full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
-			if [[ -n "${PENDING_BASE_IMAGES[$full_base_image]:-}" ]]; then
-				PENDING_ALIAS_PROMOTION_COUNT=$((PENDING_ALIAS_PROMOTION_COUNT + 1))
-			fi
-		done
-	fi
+	NEW_ALIAS_TOPOLOGY_SHA="$(alias_topology_sha NEW_ALIAS_BASE)"
+	local previous_sha
+	previous_sha="$(alias_topology_sha OLD_ALIAS_BASE)"
+	for full_tag in "${!NEW_ALIAS_BASE[@]}"; do
+		full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
+		if [[ -n "${PENDING_BASE_IMAGES[$full_base_image]:-}" ]] || \
+		   { [[ "$OLD_ALIAS_TOPOLOGY_SHA" != "$NEW_ALIAS_TOPOLOGY_SHA" ]] && \
+		     [[ "$previous_sha" != "$OLD_ALIAS_TOPOLOGY_SHA" || "${OLD_ALIAS_BASE[$full_tag]:-}" != "$full_base_image" ]]; }; then
+			# After a dry-run or interrupted publication the previous working
+			# manifest may differ from committed registry state. Reconcile every
+			# desired alias if that earlier ownership map cannot be trusted.
+			PENDING_ALIASES["$full_tag"]=1
+		fi
+	done
+	PENDING_ALIAS_PROMOTION_COUNT="${#PENDING_ALIASES[@]}"
 }
 
 # The JSON array is chronological: its final tag is published last. Resolve
@@ -1317,7 +1355,7 @@ declare -A FINAL_ALIAS_SET=()
 declare -A FINAL_BUILD_ALIAS=()
 
 plan_final_publications() {
-	local tag full_tag full_base_image line key
+	local tag full_tag full_base_image
 	while IFS= read -r tag; do
 		full_tag="${IMAGE_NAME}:${tag}"
 		full_base_image="${NEW_ALIAS_BASE[$full_tag]:-}"
@@ -1329,21 +1367,14 @@ plan_final_publications() {
 		FINAL_BUILD_ALIAS["$full_base_image"]="$full_tag"
 	done < <(jq -r '.publishLast[]' "$BUILD_CONFIG_FILE")
 
-	# Local loads keep incremental behavior. A publishing batch refreshes all
-	# configured defaults whenever any build or alias promotion is required.
+	# Publish the configured tail last even when its source is already verified.
+	# Its versioned image only needs rebuilding when its actual inputs change.
 	[[ "$BUILD_ONLY" == "no" ]] || return 0
 	[[ "$PENDING_BUILD_COUNT" -gt 0 || "$PENDING_ALIAS_PROMOTION_COUNT" -gt 0 ]] || return 0
 	for full_tag in "${FINAL_ALIASES[@]}"; do
-		full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
-		line="${NEW_BASE_RECORD[$full_base_image]}"
-		is_pending_build "$line" && continue
-		key="$(manifest_build_key "$line")"
-		PENDING_BUILDS["$key"]=1
-		PENDING_BASE_IMAGES["$full_base_image"]=1
-		PENDING_BUILD_COUNT=$((PENDING_BUILD_COUNT + 1))
-		echo "  ↪ Scheduling final refresh for $full_tag"
+		PENDING_ALIASES["$full_tag"]=1
 	done
-	count_pending_alias_promotions
+	PENDING_ALIAS_PROMOTION_COUNT="${#PENDING_ALIASES[@]}"
 }
 
 builder_platform_key() {
@@ -1751,15 +1782,12 @@ ensure_verified_registry_source() {
 	REGISTRY_SOURCE_REFERENCE="${image}@${digest}"
 }
 
-promote_planned_alias() {
+plan_alias() {
 	local full_tag="$1"
 	local full_base_image="${NEW_ALIAS_BASE[$full_tag]}"
 	local line="${NEW_ALIAS_RECORD[$full_tag]}"
 
-	if [[ "$ALIAS_TOPOLOGY_CHANGED" == "no" ]] && \
-	   [[ -z "${BUILT_IMAGES[$full_base_image]:-}" ]]; then
-		return 0
-	fi
+	[[ -n "${PENDING_ALIASES[$full_tag]:-}" ]] || return 0
 	if [[ "$BUILD_ONLY" == "yes" ]] && [[ -z "${BUILT_IMAGES[$full_base_image]:-}" ]]; then
 		return 0
 	fi
@@ -1773,9 +1801,7 @@ promote_planned_alias() {
 	fi
 
 	ensure_verified_registry_source "$full_base_image" "$line" || return 1
-	docker buildx imagetools create \
-		--tag "$full_tag" \
-		"$REGISTRY_SOURCE_REFERENCE"
+	printf '%s\t%s\n' "$full_tag" "$REGISTRY_SOURCE_REFERENCE" >> "$PUBLICATION_PLAN"
 }
 
 # --------------------------------------------------
@@ -1813,11 +1839,18 @@ fi
 
 for full_tag in "${PLANNED_ALIASES[@]}"; do
 	[[ -n "${FINAL_ALIAS_SET[$full_tag]:-}" ]] && continue
-	promote_planned_alias "$full_tag"
+	plan_alias "$full_tag"
 done
+if [[ "${#FINAL_ALIASES[@]}" -gt 0 && "$PENDING_ALIAS_PROMOTION_COUNT" -gt 0 && "$BUILD_ONLY" == "no" && "$DRY_RUN" == "no" ]]; then
+	printf '# publish-last\n' >> "$PUBLICATION_PLAN"
+fi
 for full_tag in "${FINAL_ALIASES[@]}"; do
-	promote_planned_alias "$full_tag"
+	plan_alias "$full_tag"
 done
+
+if [[ -s "$PUBLICATION_PLAN" && -z "$PREPARE_PUBLICATION_DIR" ]]; then
+	"$SCRIPT_DIR/publish-aliases.sh" "$PUBLICATION_PLAN"
+fi
 
 if [[ "$PENDING_BUILD_COUNT" -eq 0 ]] && \
    [[ "$BUILD_ONLY" == "yes" || "$PENDING_ALIAS_PROMOTION_COUNT" -eq 0 ]]; then
@@ -1850,9 +1883,8 @@ while IFS= read -r -d '' generated_dockerfile; do
 done < <(find "$IMAGES_PATH" -mindepth 5 -maxdepth 5 -type f -name Dockerfile -print0)
 
 if [[ "$DRY_RUN" == "no" ]]; then
-	# Registry alias topology is publication state, so only advance it after
-	# every immutable build, verification, and alias promotion has succeeded.
-	# Local build-only runs preserve the last known registry topology.
+	# Split CI carries these candidate hashes alongside the immutable alias
+	# plan and commits them only after the separate publishing job succeeds.
 	if [[ "$BUILD_ONLY" == "yes" ]]; then
 		if [[ -n "$OLD_ALIAS_TOPOLOGY_SHA" ]]; then
 			printf 'alias-topology %s\n' "$OLD_ALIAS_TOPOLOGY_SHA" >> "$NEXT_HASHES_FILE"
@@ -1863,17 +1895,20 @@ if [[ "$DRY_RUN" == "no" ]]; then
 
 	sort -u "$NEXT_HASHES_FILE" -o "$NEXT_HASHES_FILE"
 	chmod 0644 "$NEXT_HASHES_FILE"
-	mv "$NEXT_HASHES_FILE" "$HASHES_FILE"
-	rm -f -- "$PREVIOUS_BUILD_MANIFEST_FILE"
-	trap - EXIT
+	if [[ -n "$PREPARE_PUBLICATION_DIR" ]]; then
+		mv -- "$NEXT_HASHES_FILE" "$PREPARE_PUBLICATION_DIR/hashes.txt"
+	else
+		mv -- "$NEXT_HASHES_FILE" "$HASHES_FILE"
+	fi
 else
 	echo "ℹ️  Build state was not changed during dry-run"
 fi
 
 echo
-echo "✅ All images built and tagged successfully"
-
-if [[ "$DRY_RUN" == "no" ]] && [[ "$BUILD_ONLY" == "no" ]]; then
+if [[ -n "$PREPARE_PUBLICATION_DIR" ]]; then
+	mv -- "$PUBLICATION_PLAN" "$PREPARE_PUBLICATION_DIR/aliases.tsv"
+	echo "✅ Verified versioned images and prepared $PREPARE_PUBLICATION_DIR/aliases.tsv"
+elif [[ "$DRY_RUN" == "no" ]] && [[ "$BUILD_ONLY" == "no" ]]; then
 	echo "✅ Registry publication complete"
 else
 	echo "ℹ️  Registry push skipped (dry-run or build-only)"
