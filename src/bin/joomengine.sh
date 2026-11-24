@@ -359,7 +359,18 @@ mkdir -p "$LOG_PATH"
 # Preserve the last committed/generated alias topology before regenerating the
 # manifest. Alias ownership can change even when no image content changes.
 PREVIOUS_BUILD_MANIFEST_FILE="$(mktemp "${BUILD_MANIFEST_FILE}.previous.XXXXXX")"
-if [[ -f "$BUILD_MANIFEST_FILE" ]]; then
+declare -A MODIFIED_RECIPES=()
+# A dry-run or a previous prepare may already have regenerated the manifest.
+# When hashes still equal the last commit, that commit also holds the matching
+# publication manifest and recipes. Independently generated local state uses
+# the working snapshot, whose topology is verified against its recorded hash.
+if git -C "$REPO_ROOT" cat-file -e HEAD:conf/hashes.txt 2>/dev/null && \
+   git -C "$REPO_ROOT" diff --quiet HEAD -- conf/hashes.txt && \
+   git -C "$REPO_ROOT" show HEAD:conf/manifest.ndjson > "$PREVIOUS_BUILD_MANIFEST_FILE" 2>/dev/null; then
+	while IFS= read -r -d '' recipe; do
+		MODIFIED_RECIPES["$recipe"]=1
+	done < <(git -C "$REPO_ROOT" diff --name-only -z HEAD -- images)
+elif [[ -f "$BUILD_MANIFEST_FILE" ]]; then
 	cp "$BUILD_MANIFEST_FILE" "$PREVIOUS_BUILD_MANIFEST_FILE"
 fi
 NEXT_BUILD_MANIFEST_FILE="$(mktemp "${BUILD_MANIFEST_FILE}.next.XXXXXX")"
@@ -790,6 +801,7 @@ for i in "${!REL_VERSION[@]}"; do
 
 					legacy_record="${HASH_RECORD/ "$BUILD_INPUT_SHA" / "$LEGACY_BUILD_INPUT_SHA" }"
 					if [[ "$FORCE_UPDATE" == "no" && ! -e "${target_dir}/docker-entrypoint.sh" ]] && \
+					   [[ -z "${MODIFIED_RECIPES[images/$target/Dockerfile]:-}" ]] && \
 					   grep -Fxq -- "$legacy_record" "$HASHES_FILE" && \
 					   cmp -s -- "$CANDIDATE_DOCKERFILE" "${target_dir}/Dockerfile"; then
 						MIGRATED_CONTEXT_KEYS["$target"]="$BUILD_KEY"

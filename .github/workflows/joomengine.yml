@@ -20,6 +20,7 @@ on:
       - "conf/versions.json"
       - "conf/upstream-images.json"
       - "src/bin/check-joomla-releases.sh"
+      - "src/bin/check-publication-revision.sh"
       - "src/bin/install-crane.sh"
       - "src/bin/joomengine.sh"
       - "src/bin/publish-aliases.sh"
@@ -53,14 +54,9 @@ jobs:
           fetch-depth: 0
 
       - name: Check release revision
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
-          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" || "$GITHUB_SHA" != "$(git rev-parse FETCH_HEAD)" ]]; then
-            echo "::error::Start a new run on the current default branch to publish images."
-            exit 1
-          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./src/bin/check-publication-revision.sh
 
       - name: Install required tooling
         shell: bash
@@ -208,14 +204,12 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Check release revision and restore candidate state
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
-          if [[ "$GITHUB_SHA" != "$(git rev-parse FETCH_HEAD)" ]]; then
-            echo "::error::The default branch advanced. Start a new run on its current revision."
-            exit 1
-          fi
+          ./src/bin/check-publication-revision.sh
           patch="$RUNNER_TEMP/publication/state.patch"
           test -f "$patch"
           if [[ -s "$patch" ]]; then
